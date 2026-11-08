@@ -1,0 +1,204 @@
+//! The Timer's shared state: one Node's `NodeHost`, the config, crossing replay, a reduced
+//! sample trace per seat, and the pub/sub channel the WebSocket clients drink from.
+//!
+//! Guarded by a blocking critical-section mutex: every access is short and never awaits.
+
+use core::cell::RefCell;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::pubsub::PubSubChannel;
+use heapless::Deque;
+use oft_core::{Crossing, DetectConfig, NodeHost, Threshold};
+use oft_nodelink::msg::{Hello, Plan, GAIN_AUTO};
+
+pub const MAX_SEATS: usize = 8;
+/// Crossings kept for `/crossings?since=` and WebSocket replay.
+pub const CROSSING_REPLAY: usize = 64;
+/// Reduced trace: one sample per `TRACE_DT_US` per seat, `TRACE_LEN` deep (30 s at 100 Hz).
+pub const TRACE_DT_US: u64 = 10_000;
+pub const TRACE_LEN: usize = 3000;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SeatConfig {
+    pub seat: u8,
+    pub freq_mhz: u16,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThresholdConfig {
+    Auto { snr_enter: i16, hysteresis: i16 },
+    Manual { enter: i16, exit: i16 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Config {
+    pub seats: [Option<SeatConfig>; MAX_SEATS],
+    pub seats_per_node: u8,
+    pub threshold: ThresholdConfig,
+    pub min_lap_ms: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let mut seats = [None; MAX_SEATS];
+        seats[0] = Some(SeatConfig { seat: 0, freq_mhz: 5800, enabled: true });
+        Self { seats, seats_per_node: 8, threshold: ThresholdConfig::Auto { snr_enter: 150, hysteresis: 50 }, min_lap_ms: 2000 }
+    }
+}
+
+impl Config {
+    pub fn detect(&self) -> DetectConfig {
+        DetectConfig {
+            threshold: match self.threshold {
+                ThresholdConfig::Auto { snr_enter, hysteresis } => Threshold::Auto { snr_enter, hysteresis },
+                ThresholdConfig::Manual { enter, exit } => Threshold::Manual { enter, exit },
+            },
+            min_lap_us: self.min_lap_ms as u64 * 1000,
+            ..DetectConfig::default()
+        }
+    }
+
+    pub fn plan(&self) -> Plan {
+        let mut p = Plan::with(0, 0, GAIN_AUTO);
+        let mut n = 0;
+        for s in self.seats.iter().flatten().filter(|s| s.enabled) {
+            if n >= self.seats_per_node.max(1) {
+                break;
+            }
+            if p.push(s.seat, s.freq_mhz).is_ok() {
+                n += 1;
+            }
+        }
+        p
+    }
+
+    pub fn enabled_seats(&self) -> impl Iterator<Item = &SeatConfig> {
+        self.seats.iter().flatten().filter(|s| s.enabled)
+    }
+}
+
+/// A reduced-rate trace for one seat.
+pub struct Trace {
+    pub samples: Deque<i16, TRACE_LEN>,
+    /// Timer time of the newest sample.
+    pub t_last: u64,
+    pub last_rssi: i16,
+    pub rate_hz: u32,
+    /// Accumulator for decimation: sum and count of full-rate samples in the current bin.
+    acc_sum: i32,
+    acc_n: u16,
+    acc_t: u64,
+}
+
+impl Trace {
+    pub const fn new() -> Self {
+        Self { samples: Deque::new(), t_last: 0, last_rssi: 0, rate_hz: 0, acc_sum: 0, acc_n: 0, acc_t: 0 }
+    }
+
+    /// Feed one full-rate sample at Timer time `t`.
+    pub fn push(&mut self, t: u64, p: i16) {
+        self.last_rssi = p;
+        if self.acc_n == 0 {
+            self.acc_t = t;
+        }
+        self.acc_sum += p as i32;
+        self.acc_n += 1;
+        if t >= self.acc_t + TRACE_DT_US {
+            let avg = (self.acc_sum / self.acc_n as i32) as i16;
+            if self.samples.is_full() {
+                self.samples.pop_front();
+            }
+            let _ = self.samples.push_back(avg);
+            self.t_last = t;
+            self.acc_sum = 0;
+            self.acc_n = 0;
+        }
+    }
+
+    /// Timer time of the oldest stored sample.
+    pub fn t_first(&self) -> u64 {
+        self.t_last.saturating_sub((self.samples.len().saturating_sub(1) as u64) * TRACE_DT_US)
+    }
+}
+
+pub struct Inner {
+    pub host: NodeHost,
+    pub config: Config,
+    pub crossings: Deque<(u64, Crossing), CROSSING_REPLAY>,
+    pub next_seq: u64,
+    pub traces: [Option<Trace>; MAX_SEATS],
+    pub node_connected: bool,
+    pub node_temp_dc: Option<i16>,
+    pub last_node_rx_us: Option<u64>,
+    pub dropped_frames: u32,
+    /// Set by `set_config`; the node task sends the new plan and clears it.
+    pub plan_dirty: bool,
+}
+
+pub struct Timer {
+    pub inner: Mutex<CriticalSectionRawMutex, RefCell<Inner>>,
+    pub events: PubSubChannel<CriticalSectionRawMutex, Event, 32, 4, 2>,
+    pub boot_id: u32,
+    pub mac: [u8; 6],
+}
+
+/// What WebSocket clients receive. Small and `Copy`: the channel clones it per subscriber.
+#[derive(Clone, Copy, Debug)]
+pub enum Event {
+    Crossing { seq: u64, c: Crossing },
+    /// A full-rate batch from the Node, already on the Timer clock.
+    Samples { seat: u8, t0: u64, dt_us: u16, n: u8, p: [i16; 32], nf: i16 },
+    Status,
+}
+
+impl Timer {
+    pub fn new(boot_id: u32, mac: [u8; 6]) -> Self {
+        let config = Config::default();
+        let mut host = NodeHost::new(config.detect());
+        host.set_plan(config.plan());
+        Self {
+            inner: Mutex::new(RefCell::new(Inner {
+                host,
+                config,
+                crossings: Deque::new(),
+                next_seq: 1,
+                traces: [const { None }; MAX_SEATS],
+                node_connected: false,
+                node_temp_dc: None,
+                last_node_rx_us: None,
+                dropped_frames: 0,
+                plan_dirty: true,
+            })),
+            events: PubSubChannel::new(),
+            boot_id,
+            mac,
+        }
+    }
+
+    /// Run `f` with the state locked. Keep it short; never await inside.
+    pub fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        self.inner.lock(|c| f(&mut c.borrow_mut()))
+    }
+
+    pub fn set_config(&self, config: Config) {
+        self.with(|i| {
+            i.host.set_detect_config(config.detect());
+            i.host.set_plan(config.plan());
+            i.config = config;
+            for t in i.traces.iter_mut() {
+                *t = None;
+            }
+            i.plan_dirty = true;
+        });
+    }
+
+    pub fn hello(&self) -> Option<Hello> {
+        self.with(|i| i.host.hello().copied())
+    }
+}
+
+/// Timer clock: µs since boot.
+pub fn now_us() -> u64 {
+    embassy_time::Instant::now().as_micros()
+}

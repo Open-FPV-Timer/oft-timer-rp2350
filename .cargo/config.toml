@@ -1,0 +1,9 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# `cargo run` would need a debug probe; we flash the UF2 instead (see README).
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x"]
+
+[unstable]
+# not used; keep the stable toolchain

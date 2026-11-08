@@ -1,0 +1,46 @@
+[package]
+name = "oft-timer-rp2350"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "OFT Timer firmware for the Waveshare RP2350-POE-ETH (RP2350A + W6300 + PoE): one C5 Node on UART, OFT Protocol over Ethernet"
+publish = false
+
+[[bin]]
+name = "oft-timer-rp2350"
+test = false
+bench = false
+
+[dependencies]
+oft-core = { path = "../oft/crates/oft-core" }
+oft-nodelink = { path = "../oft/crates/oft-nodelink" }
+
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-rp = { version = "0.10.0", features = ["rp235xa", "time-driver", "critical-section-impl", "binary-info"] }
+embassy-time = "0.5.1"
+embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
+embassy-net-wiznet = "0.3.0"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
+embedded-io-async = "0.7.0"
+picoserve = { version = "0.20.1", features = ["embassy", "json", "ws"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde-json-core = "0.7.0"
+heapless = { version = "0.9", features = ["serde"] }
+static_cell = "2.1"
+portable-atomic = { version = "1.5", features = ["critical-section"] }
+critical-section = "1.1"
+cortex-m = { version = "0.7.6", features = ["inline-asm"] }
+cortex-m-rt = "0.7.0"
+panic-halt = "1.0"
+
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = "s"
+debug = 2
