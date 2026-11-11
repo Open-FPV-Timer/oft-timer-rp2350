@@ -984,6 +984,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oft-fwimage"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "oft-nodelink"
 version = "0.1.0"
 
@@ -1005,6 +1012,7 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
  "oft-core",
+ "oft-fwimage",
  "oft-nodelink",
  "panic-halt",
  "picoserve",
@@ -1431,6 +1439,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

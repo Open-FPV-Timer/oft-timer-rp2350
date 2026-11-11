@@ -7,6 +7,7 @@
 #![no_main]
 
 mod board;
+mod fw;
 mod node;
 mod state;
 mod web;
@@ -67,6 +68,9 @@ fn seed() -> u64 {
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
+    // Which firmware slot this is, and whether the boot ROM started it on trial after an update.
+    let fw = fw::Fw::init(p.FLASH);
+
     // Identity: last two MAC bytes and the boot id from the chip's unique id.
     let uid = embassy_rp::otp::get_chipid().unwrap_or(0x1234_5678_9ABC_DEF0);
     let mac = [board::MAC_PREFIX[0], board::MAC_PREFIX[1], board::MAC_PREFIX[2], board::MAC_PREFIX[3], (uid >> 8) as u8, uid as u8];
@@ -107,8 +111,9 @@ async fn main(spawner: Spawner) {
     // --- OFT Protocol.
     spawner.spawn(web::status_tick_task(timer).unwrap());
     for id in 0..web::WEB_TASK_POOL_SIZE {
-        spawner.spawn(web::web_task(id, stack, timer).unwrap());
+        spawner.spawn(web::web_task(id, stack, timer, fw).unwrap());
     }
+    spawner.spawn(fw::fw_task(fw, stack).unwrap());
 
     // Keep `main` alive doing nothing; the DMA channel handles are owned by the SPI.
     let _ = (p.DMA_CH2, stack);

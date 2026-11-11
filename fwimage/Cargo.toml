@@ -1,0 +1,10 @@
+[package]
+name = "oft-fwimage"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "OFT Timer (RP2350) firmware image checks, flash layout and the update receiver: pure logic, tested on the host"
+publish = false
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }

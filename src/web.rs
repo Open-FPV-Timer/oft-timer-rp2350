@@ -2,6 +2,7 @@
 //! samples,stream}`. JSON is built with serde-json-core into fixed buffers.
 
 use crate::board::OFT_PORT;
+use crate::fw::{Fw, Other};
 use crate::state::{Config, Event, SeatConfig, ThresholdConfig, Timer, MAX_SEATS, TRACE_DT_US};
 use core::fmt::Write as _;
 use embassy_net::Stack;
@@ -14,8 +15,12 @@ use serde::{Deserialize, Serialize};
 
 pub const WEB_TASK_POOL_SIZE: usize = 4;
 
+/// Capacity of a JSON body built in place. The largest is the WebSocket `hello` with eight
+/// seats enabled, a little over 1 KiB.
+const BODY: usize = 1280;
+
 #[derive(Clone, Copy)]
-pub struct AppState(pub &'static Timer);
+pub struct AppState(pub &'static Timer, pub &'static Fw);
 
 // ------------------------------------------------------------------ JSON shapes
 
@@ -211,7 +216,7 @@ fn status_json(t: &Timer) -> StatusJson {
 }
 
 /// `/info` and the WebSocket `hello` share this body; `hello` adds a few fields.
-fn info_json(t: &Timer, hello: bool, out: &mut String<1024>) {
+fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) {
     let h = t.hello();
     let (seats, rate) = t.with(|i| {
         let mut v: Vec<(u8, u32), MAX_SEATS> = Vec::new();
@@ -252,19 +257,21 @@ fn info_json(t: &Timer, hello: bool, out: &mut String<1024>) {
          \"samples.stream\":{{\"rate_hz\":{},\"decimate\":[1,2,5,10,20,50]}},\
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
          \"config\":{{\"persist\":false,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seats_per_node\":true,\"exit_hold_ms\":true}},\
-         \"time\":{{\"sync\":[\"sync\",\"ping\"]}}}}}}",
+         \"time\":{{\"sync\":[\"sync\",\"ping\"]}},\
+         \"fw.update\":{{\"nodes\":[],\"self\":{}}}}}}}",
         crate::state::CROSSING_REPLAY,
         rate,
         crate::state::TRACE_LEN as u64 * TRACE_DT_US / 1_000_000,
-        1_000_000 / TRACE_DT_US
+        1_000_000 / TRACE_DT_US,
+        self_update
     );
 }
 
 /// A raw, pre-built JSON body with a status code.
-struct RawJson(StatusCode, String<1024>);
+struct RawJson(StatusCode, String<BODY>);
 
 impl RawJson {
-    fn ok(s: String<1024>) -> Self {
+    fn ok(s: String<BODY>) -> Self {
         RawJson(StatusCode::OK, s)
     }
     fn error(code: u16, msg: &str) -> Self {
@@ -282,7 +289,7 @@ impl RawJson {
     }
 }
 
-struct JsonBody(String<1024>);
+struct JsonBody(String<BODY>);
 
 impl Content for JsonBody {
     fn content_type(&self) -> &'static str {
@@ -308,27 +315,28 @@ impl IntoResponse for RawJson {
 
 // ------------------------------------------------------------------ handlers
 
-async fn info(State(AppState(t)): State<AppState>) -> RawJson {
+async fn info(State(AppState(t, fw)): State<AppState>) -> RawJson {
+    fw.note_http();
     let mut s = String::new();
-    info_json(t, false, &mut s);
+    info_json(t, fw.self_update(), false, &mut s);
     RawJson::ok(s)
 }
 
-async fn status(State(AppState(t)): State<AppState>) -> Json<StatusJson> {
+async fn status(State(AppState(t, _)): State<AppState>) -> Json<StatusJson> {
     Json(status_json(t))
 }
 
-async fn time(State(AppState(t)): State<AppState>) -> RawJson {
+async fn time(State(AppState(t, _)): State<AppState>) -> RawJson {
     let mut s = String::new();
     let _ = write!(s, "{{\"time_us\":{},\"boot_id\":\"{:08x}\"}}", crate::state::now_us(), t.boot_id);
     RawJson::ok(s)
 }
 
-async fn get_config(State(AppState(t)): State<AppState>) -> Json<ConfigJson> {
+async fn get_config(State(AppState(t, _)): State<AppState>) -> Json<ConfigJson> {
     Json(t.with(|i| ConfigJson::from(&i.config)))
 }
 
-async fn put_config(State(AppState(t)): State<AppState>, picoserve::extract::Json(c): picoserve::extract::Json<ConfigJson>) -> RawJson {
+async fn put_config(State(AppState(t, _)): State<AppState>, picoserve::extract::Json(c): picoserve::extract::Json<ConfigJson>) -> RawJson {
     match c.into_config() {
         Ok(cfg) => {
             t.set_config(cfg);
@@ -338,8 +346,8 @@ async fn put_config(State(AppState(t)): State<AppState>, picoserve::extract::Jso
     }
 }
 
-async fn crossings(State(AppState(t)): State<AppState>, Query(q): Query<SinceQ>) -> RawJson {
-    let mut s: String<1024> = String::new();
+async fn crossings(State(AppState(t, _)): State<AppState>, Query(q): Query<SinceQ>) -> RawJson {
+    let mut s: String<BODY> = String::new();
     let _ = write!(s, "{{\"boot_id\":\"{:08x}\",\"crossings\":[", t.boot_id);
     let items: Vec<(u64, oft_core::Crossing), 8> = t.with(|i| i.crossings.iter().filter(|(seq, _)| *seq > q.since).take(8).copied().collect());
     for (k, (seq, c)) in items.iter().enumerate() {
@@ -358,8 +366,8 @@ async fn crossings(State(AppState(t)): State<AppState>, Query(q): Query<SinceQ>)
     RawJson::ok(s)
 }
 
-async fn samples(State(AppState(t)): State<AppState>, Query(q): Query<SamplesQ>) -> RawJson {
-    let mut s: String<1024> = String::new();
+async fn samples(State(AppState(t, _)): State<AppState>, Query(q): Query<SamplesQ>) -> RawJson {
+    let mut s: String<BODY> = String::new();
     let ok = t.with(|i| {
         let Some(tr) = i.traces.get(q.seat as usize).and_then(|t| t.as_ref()) else { return false };
         let t_first = tr.t_first();
@@ -424,7 +432,7 @@ fn one() -> u32 {
     1
 }
 
-struct Stream(&'static Timer);
+struct Stream(&'static Timer, &'static Fw);
 
 impl ws::WebSocketCallback for Stream {
     async fn run<R: picoserve::io::Read, W: picoserve::io::Write<Error = R::Error>>(self, mut rx: ws::SocketRx<R>, mut tx: ws::SocketTx<W>) -> Result<(), W::Error> {
@@ -435,9 +443,9 @@ impl ws::WebSocketCallback for Stream {
         let mut want_status = false;
         let mut decim: [u32; MAX_SEATS] = [0; MAX_SEATS];
         let mut in_buf = [0u8; 512];
-        let mut body: String<1024> = String::new();
+        let mut body: String<BODY> = String::new();
 
-        info_json(t, true, &mut body);
+        info_json(t, self.1.self_update(), true, &mut body);
         tx.send_text(body.as_str()).await?;
 
         let close = loop {
@@ -528,7 +536,7 @@ fn opt_bool(v: Option<bool>) -> &'static str {
 }
 
 /// Progress and result of the Node wiring test.
-async fn get_wiretest(State(AppState(t)): State<AppState>) -> RawJson {
+async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
     let w = t.with(|i| i.wire_test);
     let mut s = String::new();
     let _ = write!(
@@ -548,7 +556,8 @@ async fn get_wiretest(State(AppState(t)): State<AppState>) -> RawJson {
 
 /// Start the Node wiring test (EN and BOOT lines). Bench diagnostic, not part of the OFT
 /// Protocol: it resets the Node three times and stops timing while it runs.
-async fn post_wiretest(State(AppState(t)): State<AppState>) -> RawJson {
+async fn post_wiretest(State(state): State<AppState>) -> RawJson {
+    let t = state.0;
     if t.with(|i| i.wire_test.running) {
         return RawJson::error(409, "the wiring test is already running");
     }
@@ -556,7 +565,7 @@ async fn post_wiretest(State(AppState(t)): State<AppState>) -> RawJson {
         i.wire_test = crate::state::WireTest { running: true, step: "starting", ..Default::default() };
     });
     crate::node::WIRE_TEST.signal(());
-    get_wiretest(State(AppState(t))).await
+    get_wiretest(State(state)).await
 }
 
 /// Set by `POST /oft/v1/fw/bootsel`; the status task restarts the board once the reply is out.
@@ -572,8 +581,167 @@ async fn fw_bootsel() -> RawJson {
     RawJson::ok(s)
 }
 
-async fn stream(State(AppState(t)): State<AppState>, upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
-    upgrade.on_upgrade(Stream(t))
+// ------------------------------------------------------------------ firmware update
+
+fn other_json(o: Other, out: &mut String<BODY>) {
+    let _ = match o {
+        Other::Empty => write!(out, "null"),
+        Other::Confirmed(build) => write!(out, "{{\"build\":{},\"confirmed\":true}}", build),
+        Other::Unconfirmed(build) => write!(out, "{{\"build\":{},\"confirmed\":false}}", build),
+    };
+}
+
+fn opt_u32(v: Option<u32>, out: &mut String<BODY>) {
+    let _ = match v {
+        Some(v) => write!(out, "{}", v),
+        None => write!(out, "null"),
+    };
+}
+
+/// State of the Timer's own firmware update: which slot runs, its build number, whether it
+/// is still on trial, and what the other slot holds. Not part of the OFT Protocol.
+///
+/// A new firmware on trial counts this request (and `/info`) as proof that it can be
+/// reached over Ethernet, and confirms itself shortly after answering one.
+async fn get_fw_timer(State(AppState(_, fw)): State<AppState>) -> RawJson {
+    fw.note_http();
+    let mut s: String<BODY> = String::new();
+    let supported = fw.slot.is_ok() && !fw.seal_ignored;
+    let _ = write!(s, "{{\"supported\":{},", supported);
+    if let Ok(slot) = fw.slot {
+        let _ = write!(s, "\"slot\":\"{}\",", slot.name());
+    }
+    if !supported {
+        let reason = match fw.slot {
+            Err(e) => e.as_str(),
+            Ok(_) => crate::fw::NotReady::SealIgnored.as_str(),
+        };
+        let _ = write!(s, "\"reason\":\"{}\",", reason);
+    }
+    let state = if fw.restarting() {
+        "restarting"
+    } else if fw.on_trial() {
+        "trial"
+    } else {
+        "confirmed"
+    };
+    let _ = write!(s, "\"state\":\"{}\",\"build\":", state);
+    opt_u32(fw.build, &mut s);
+    let _ = write!(s, ",\"other\":");
+    other_json(fw.other(), &mut s);
+    let _ = write!(s, ",\"busy\":{},\"max_bytes\":{},\"confirm_error\":{},", fw.store.try_lock().is_err(), oft_fwimage::layout::MAX_IMAGE_BYTES, fw.buy_error());
+    // For diagnosis: what the boot ROM said about this boot, and the flash mapping.
+    let _ = write!(s, "\"seal_ignored\":{},\"rom\":{{\"atrans0\":\"{:#010x}\"", fw.seal_ignored, fw.atrans0);
+    if let Some(b) = fw.boot {
+        let _ = write!(s, ",\"boot_type\":{},\"partition\":{},\"tbyb\":{},\"diagnostic\":\"{:#010x}\",\"update_base\":\"{:#010x}\"", b.boot_type, b.partition, b.tbyb_and_update, b.diagnostic, b.reboot_params[0]);
+    }
+    let _ = s.push_str("}}");
+    RawJson::ok(s)
+}
+
+/// `POST /oft/v1/fw/timer`: the body is a firmware image (`oft-timer.bin` from
+/// `tools/uf2.py`), `Content-Length` its size. It is written to the slot that is not
+/// running, verified there, and the Timer restarts to try it. See `fw.rs`.
+/// Bench convenience, not part of the OFT Protocol: anyone on the network can call it.
+struct FwUpload;
+
+/// Read the rest of the body and throw it away, so the reply reaches a client that is still
+/// sending.
+async fn drain<R: picoserve::io::Read>(reader: &mut R) -> Result<(), R::Error> {
+    let mut chunk = [0u8; 256];
+    while reader.read(&mut chunk).await? != 0 {}
+    Ok(())
+}
+
+async fn fw_receive<R: picoserve::io::Read>(fw: &'static Fw, request: &mut picoserve::request::Request<'_, R>) -> Result<RawJson, R::Error> {
+    use oft_fwimage::receiver::Receiver;
+    use picoserve::io::Read as _;
+    let len = request.body_connection.content_length();
+    if len > oft_fwimage::layout::MAX_IMAGE_BYTES as usize {
+        // Not worth reading: the connection closes after the reply.
+        return Ok(RawJson::error(413, oft_fwimage::image::ImageError::TooLarge.as_str()));
+    }
+    let mut reader = request.body_connection.body().reader().with_different_timeout(embassy_time::Duration::from_secs(120));
+    let running = match fw.ready() {
+        Ok(slot) => slot,
+        Err(e) => {
+            drain(&mut reader).await?;
+            return Ok(RawJson::error(409, e.as_str()));
+        }
+    };
+    let Ok(mut store) = fw.store.try_lock() else {
+        drain(&mut reader).await?;
+        return Ok(RawJson::error(409, "another firmware upload is in progress"));
+    };
+    let (mut spare, bufs) = store.spare(running);
+    let mut rx = Receiver::new(len as u32);
+    let mut failure: Option<&'static str> = None;
+    let mut chunk = [0u8; 1024];
+    loop {
+        // A read error (the client went away, or the 120 s limit) ends the request here: the
+        // spare slot is left without its first sector, which the boot ROM treats as empty.
+        let n = match reader.read(&mut chunk).await {
+            Ok(n) => n,
+            Err(e) => {
+                if rx.started() {
+                    fw.spare_spoiled();
+                }
+                return Err(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if failure.is_none() {
+            // Erases and programs flash a sector at a time, with interrupts off while it does.
+            if let Err(e) = rx.push(bufs, &mut spare, &chunk[..n]) {
+                failure = Some(e.as_str());
+            }
+        }
+    }
+    let result = match failure {
+        Some(m) => Err(m),
+        None => rx.finish(bufs, &mut spare).map_err(|e| e.as_str()),
+    };
+    match result {
+        Ok(info) => {
+            let target = running.other();
+            fw.switch_to(target, &info);
+            let mut s: String<BODY> = String::new();
+            let _ = write!(
+                s,
+                "{{\"ok\":true,\"slot\":\"{}\",\"build\":{},\"bytes\":{},\"msg\":\"stored and verified; restarting to try it\"}}",
+                target.name(),
+                info.build,
+                info.len
+            );
+            Ok(RawJson::ok(s))
+        }
+        Err(m) => {
+            if rx.started() {
+                fw.spare_spoiled();
+            }
+            Ok(RawJson::error(422, m))
+        }
+    }
+}
+
+impl picoserve::routing::RequestHandlerService<AppState> for FwUpload {
+    async fn call_request_handler_service<R: picoserve::io::Read, W: picoserve::response::ResponseWriter<Error = R::Error>>(
+        &self,
+        state: &AppState,
+        (): (),
+        mut request: picoserve::request::Request<'_, R>,
+        response_writer: W,
+    ) -> Result<picoserve::ResponseSent, W::Error> {
+        let reply = fw_receive(state.1, &mut request).await?;
+        let connection = request.body_connection.finalize().await?;
+        reply.write_to(connection, response_writer).await
+    }
+}
+
+async fn stream(State(AppState(t, fw)): State<AppState>, upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
+    upgrade.on_upgrade(Stream(t, fw))
 }
 
 // ------------------------------------------------------------------ server
@@ -582,7 +750,7 @@ static CONFIG: picoserve::Config = picoserve::Config::const_default().keep_conne
 
 /// One HTTP connection at a time per task; `WEB_TASK_POOL_SIZE` tasks run.
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
-pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Timer) -> ! {
+pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Timer, fw: &'static Fw) -> ! {
     let app = picoserve::Router::new()
         // The built-in diagnostics page: the same file every Timer host serves.
         .route("/", get_service(picoserve::response::File::html(include_str!("../../oft/web/timer.html"))))
@@ -594,8 +762,9 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
         .route("/oft/v1/samples", get(samples))
         .route("/oft/v1/stream", get(stream))
         .route("/oft/v1/fw/bootsel", post(fw_bootsel))
+        .route("/oft/v1/fw/timer", get(get_fw_timer).post_service(FwUpload))
         .route("/oft/v1/node/wiretest", get(get_wiretest).post(post_wiretest))
-        .with_state(AppState(timer));
+        .with_state(AppState(timer, fw));
     let mut tcp_rx = [0u8; 1024];
     let mut tcp_tx = [0u8; 2048];
     let mut http = [0u8; 2048];

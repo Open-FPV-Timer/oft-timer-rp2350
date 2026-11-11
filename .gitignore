@@ -1,3 +1,6 @@
 /target
 /oft-timer.uf2
 /oft-timer.bin
+/oft-timer-flat.uf2
+/fwimage/target
+/fwimage/Cargo.lock
