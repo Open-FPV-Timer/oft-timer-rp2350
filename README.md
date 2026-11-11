@@ -23,6 +23,10 @@ Then plug Ethernet (PoE) in. The Timer takes a DHCP address and serves
 `http://<ip>:7270/oft/v1/info`. mDNS is not implemented yet: find the address on the switch
 or router, or use `oftd`-style discovery later.
 
+To update a board that already runs this firmware without pressing BOOT, leave its USB-C
+plugged into a computer and send `POST /oft/v1/fw/bootsel`: it restarts as the `RP2350` drive.
+There is no update over the network yet.
+
 ## Wiring
 
 | Signal | RP2350 | XIAO ESP32-C5 |

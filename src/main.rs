@@ -86,6 +86,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(node::node_rx_task(timer, uart_rx).unwrap());
     spawner.spawn(node::node_tx_task(timer, uart_tx).unwrap());
     spawner.spawn(node::sync_task(timer, Output::new(p.PIN_6, Level::Low)).unwrap());
+    spawner.spawn(node::node_ctl_task(timer, en, boot).unwrap());
 
     // --- Ethernet: W6300 on SPI0.
     let mut scfg = SpiConfig::default();

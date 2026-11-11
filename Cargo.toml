@@ -16,7 +16,7 @@ oft-core = { path = "../oft/crates/oft-core" }
 oft-nodelink = { path = "../oft/crates/oft-nodelink" }
 
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
-embassy-rp = { version = "0.10.0", features = ["rp235xa", "time-driver", "critical-section-impl", "binary-info"] }
+embassy-rp = { version = "0.10.0", features = ["rp235xa", "time-driver", "critical-section-impl", "binary-info", "unstable-pac"] }
 embassy-time = "0.5.1"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"

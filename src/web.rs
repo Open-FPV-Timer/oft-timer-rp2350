@@ -9,7 +9,7 @@ use heapless::{String, Vec};
 use picoserve::extract::{Query, State};
 use picoserve::response::ws;
 use picoserve::response::{Content, IntoResponse, Json, Response, StatusCode};
-use picoserve::routing::get;
+use picoserve::routing::{get, get_service, post};
 use serde::{Deserialize, Serialize};
 
 pub const WEB_TASK_POOL_SIZE: usize = 4;
@@ -55,6 +55,17 @@ struct SeatStatusJson {
     crossing: bool,
 }
 
+/// Health of the Node link, so lost samples can be traced to their cause (counts since boot).
+#[derive(Serialize)]
+struct LinkJson {
+    gap_samples: u32,
+    crc_errors: u32,
+    uart_errors: u32,
+    node_overruns: Option<u16>,
+    node_hop_errors: Option<u16>,
+    node_gain: Option<u8>,
+}
+
 #[derive(Serialize)]
 struct StatusJson {
     #[serde(rename = "type")]
@@ -68,6 +79,7 @@ struct StatusJson {
     clock_source: &'static str,
     drift_ppm: Option<f64>,
     node_connected: bool,
+    link: LinkJson,
     seats: Vec<SeatStatusJson, MAX_SEATS>,
 }
 
@@ -99,6 +111,9 @@ struct ConfigJson {
     seats_per_node: u8,
     threshold: ThresholdJson,
     min_lap_ms: u32,
+    /// Absent (older clients) means the default.
+    #[serde(default)]
+    exit_hold_ms: Option<u32>,
 }
 
 impl From<&Config> for ConfigJson {
@@ -111,7 +126,7 @@ impl From<&Config> for ConfigJson {
             ThresholdConfig::Auto { snr_enter, hysteresis } => ThresholdJson { mode: String::try_from("auto").unwrap(), snr_enter: Some(snr_enter), hysteresis: Some(hysteresis), enter: None, exit: None },
             ThresholdConfig::Manual { enter, exit } => ThresholdJson { mode: String::try_from("manual").unwrap(), snr_enter: None, hysteresis: None, enter: Some(enter), exit: Some(exit) },
         };
-        Self { seats, seats_per_node: c.seats_per_node, threshold, min_lap_ms: c.min_lap_ms }
+        Self { seats, seats_per_node: c.seats_per_node, threshold, min_lap_ms: c.min_lap_ms, exit_hold_ms: Some(c.exit_hold_ms) }
     }
 }
 
@@ -133,7 +148,7 @@ impl ConfigJson {
             "manual" => ThresholdConfig::Manual { enter: t.enter.ok_or("enter required")?, exit: t.exit.ok_or("exit required")? },
             _ => return Err("threshold.mode must be auto or manual"),
         };
-        Ok(Config { seats, seats_per_node: self.seats_per_node.clamp(1, 8), threshold, min_lap_ms: self.min_lap_ms })
+        Ok(Config { seats, seats_per_node: self.seats_per_node.clamp(1, 8), threshold, min_lap_ms: self.min_lap_ms, exit_hold_ms: self.exit_hold_ms.unwrap_or(Config::default().exit_hold_ms).min(1000) })
     }
 }
 
@@ -182,6 +197,14 @@ fn status_json(t: &Timer) -> StatusJson {
             clock_source: i.host.sync_source(),
             drift_ppm: clock.is_synced().then(|| clock.drift_ppm()),
             node_connected: i.node_connected,
+            link: LinkJson {
+                gap_samples: i.host.dropped_samples,
+                crc_errors: i.dropped_frames,
+                uart_errors: i.uart_errors,
+                node_overruns: i.node_status.map(|s| s.overruns),
+                node_hop_errors: i.node_status.map(|s| s.hop_errors),
+                node_gain: i.node_status.map(|s| s.gain_index),
+            },
             seats,
         }
     })
@@ -228,7 +251,7 @@ fn info_json(t: &Timer, hello: bool, out: &mut String<1024>) {
         "],\"capabilities\":{{\"crossings\":{{\"algorithms\":[\"edge_mid\"],\"replay\":{},\"fields\":[\"t_enter\",\"t_exit\",\"peak\",\"snr\"]}},\
          \"samples.stream\":{{\"rate_hz\":{},\"decimate\":[1,2,5,10,20,50]}},\
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
-         \"config\":{{\"persist\":false,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seats_per_node\":true}},\
+         \"config\":{{\"persist\":false,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seats_per_node\":true,\"exit_hold_ms\":true}},\
          \"time\":{{\"sync\":[\"sync\",\"ping\"]}}}}}}",
         crate::state::CROSSING_REPLAY,
         rate,
@@ -320,13 +343,16 @@ async fn crossings(State(AppState(t)): State<AppState>, Query(q): Query<SinceQ>)
     let _ = write!(s, "{{\"boot_id\":\"{:08x}\",\"crossings\":[", t.boot_id);
     let items: Vec<(u64, oft_core::Crossing), 8> = t.with(|i| i.crossings.iter().filter(|(seq, _)| *seq > q.since).take(8).copied().collect());
     for (k, (seq, c)) in items.iter().enumerate() {
+        let mut buf = [0u8; 256];
+        let Ok(n) = serde_json_core::to_slice(&crossing_json(*seq, c), &mut buf) else { continue };
+        // Leave room for the comma and the closing "]}"; the client asks again with `since`.
+        if s.len() + n + 3 > s.capacity() {
+            break;
+        }
         if k > 0 {
             let _ = s.push(',');
         }
-        let mut buf = [0u8; 256];
-        if let Ok(n) = serde_json_core::to_slice(&crossing_json(*seq, c), &mut buf) {
-            let _ = s.push_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
-        }
+        let _ = s.push_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
     }
     let _ = s.push_str("]}");
     RawJson::ok(s)
@@ -348,12 +374,15 @@ async fn samples(State(AppState(t)): State<AppState>, Query(q): Query<SamplesQ>)
             if first_t.is_none() {
                 first_t = Some(tk);
             }
-            if !body.is_empty() && body.push(',').is_err() {
+            // Stop while a comma and the longest value ("-32768") still fit, so the list
+            // never ends in a dangling comma or a cut-off number.
+            if body.len() + 7 > body.capacity() {
                 break;
             }
-            if write!(body, "{}", p).is_err() {
-                break;
+            if !body.is_empty() {
+                let _ = body.push(',');
             }
+            let _ = write!(body, "{}", p);
         }
         let Some(t0) = first_t else { return false };
         let _ = write!(s, "{{\"type\":\"samples\",\"seat\":{},\"t0\":{},\"dt_us\":{},\"p\":[{}],\"nf\":{}}}", q.seat, t0, TRACE_DT_US, body, floor);
@@ -477,7 +506,7 @@ impl ws::WebSocketCallback for Stream {
                         }
                     }
                     Event::Status if want_status => {
-                        let mut buf = [0u8; 768];
+                        let mut buf = [0u8; 1024];
                         if let Ok(n) = serde_json_core::to_slice(&status_json(t), &mut buf) {
                             tx.send_text(core::str::from_utf8(&buf[..n]).unwrap_or("{}")).await?;
                         }
@@ -488,6 +517,59 @@ impl ws::WebSocketCallback for Stream {
         };
         tx.close(close).await
     }
+}
+
+fn opt_bool(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    }
+}
+
+/// Progress and result of the Node wiring test.
+async fn get_wiretest(State(AppState(t)): State<AppState>) -> RawJson {
+    let w = t.with(|i| i.wire_test);
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "{{\"running\":{},\"done\":{},\"step\":\"{}\",\"en_ok\":{},\"en_ms\":{},\"boot_ok\":{},\"recovered\":{},\"recover_ms\":{}}}",
+        w.running,
+        w.done,
+        w.step,
+        opt_bool(w.en_ok),
+        w.en_ms,
+        opt_bool(w.boot_ok),
+        opt_bool(w.recovered),
+        w.recover_ms
+    );
+    RawJson::ok(s)
+}
+
+/// Start the Node wiring test (EN and BOOT lines). Bench diagnostic, not part of the OFT
+/// Protocol: it resets the Node three times and stops timing while it runs.
+async fn post_wiretest(State(AppState(t)): State<AppState>) -> RawJson {
+    if t.with(|i| i.wire_test.running) {
+        return RawJson::error(409, "the wiring test is already running");
+    }
+    t.with(|i| {
+        i.wire_test = crate::state::WireTest { running: true, step: "starting", ..Default::default() };
+    });
+    crate::node::WIRE_TEST.signal(());
+    get_wiretest(State(AppState(t))).await
+}
+
+/// Set by `POST /oft/v1/fw/bootsel`; the status task restarts the board once the reply is out.
+static BOOTSEL_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Restart into the ROM's USB bootloader (the `RP2350` drive), as holding BOOT while
+/// plugging in does, so a new UF2 can be copied on without reaching the button.
+/// Bench convenience, not part of the OFT Protocol: anyone on the network can call it.
+async fn fw_bootsel() -> RawJson {
+    BOOTSEL_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
+    let mut s = String::new();
+    let _ = s.push_str("{\"ok\":true,\"msg\":\"restarting into USB boot mode\"}");
+    RawJson::ok(s)
 }
 
 async fn stream(State(AppState(t)): State<AppState>, upgrade: ws::WebSocketUpgrade) -> impl IntoResponse {
@@ -502,7 +584,8 @@ static CONFIG: picoserve::Config = picoserve::Config::const_default().keep_conne
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
 pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Timer) -> ! {
     let app = picoserve::Router::new()
-        .route("/", get(|| async { "oft-timer-rp2350: OFT Protocol under /oft/v1, WebSocket at /oft/v1/stream\n" }))
+        // The built-in diagnostics page: the same file every Timer host serves.
+        .route("/", get_service(picoserve::response::File::html(include_str!("../../oft/web/timer.html"))))
         .route("/oft/v1/info", get(info))
         .route("/oft/v1/status", get(status))
         .route("/oft/v1/time", get(time))
@@ -510,6 +593,8 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
         .route("/oft/v1/crossings", get(crossings))
         .route("/oft/v1/samples", get(samples))
         .route("/oft/v1/stream", get(stream))
+        .route("/oft/v1/fw/bootsel", post(fw_bootsel))
+        .route("/oft/v1/node/wiretest", get(get_wiretest).post(post_wiretest))
         .with_state(AppState(timer));
     let mut tcp_rx = [0u8; 1024];
     let mut tcp_tx = [0u8; 2048];
@@ -523,6 +608,9 @@ pub async fn status_tick_task(timer: &'static Timer) {
     let publisher = timer.events.publisher().unwrap();
     loop {
         embassy_time::Timer::after_secs(1).await;
+        if BOOTSEL_REQUESTED.load(core::sync::atomic::Ordering::Relaxed) {
+            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+        }
         publisher.publish_immediate(Event::Status);
     }
 }
