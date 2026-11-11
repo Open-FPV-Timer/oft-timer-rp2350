@@ -149,3 +149,10 @@ GP23, VSYS ADC GP29. All pins are in `src/board.rs`.
   header silkscreen, whether the C5's BOOT strap is GPIO28 on the XIAO.
 
 GPL-3.0-or-later.
+
+## Acknowledgements
+
+OFT is inspired by [FPVGate](https://github.com/LouisHitchcock/FPVGateC5MK), which showed
+that an ESP32-C5 can time laps, and builds on [widscan58](https://github.com/CapnBry/widscan58),
+esp-sdr, C5VRX and RotorHazard. The full list is in the
+[oft README](https://github.com/Open-FPV-Timer/oft#acknowledgements).
