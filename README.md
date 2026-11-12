@@ -180,11 +180,13 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 
 ## Not yet
 
-- Status LED, a settable Timer name.
-- A friendlier built-in page. Today's page grew out of bench diagnostics: every control on
-  one screen, engineering terms, no guidance. It needs a plain setup flow (seats and
-  channels, levels, save), a clear at-a-glance health view, and the diagnostics and firmware
-  tools moved out of the way.
+- Status LED.
+- Renaming the Timer. Today `/info` says "OFT Timer" for every Timer, and the id
+  (`oft-a867`) comes from the chip. A name set from the page and the USB console, saved
+  with the other settings, should show in `/info`, in the page title and in the mDNS
+  announcement (as the instance name, and as `<name>.local` where it makes a valid host
+  name), so race software and people can tell Timers apart. The id stays fixed: clients
+  key on it.
 - First-boot checks: SPI clock (starts at 30 MHz; Waveshare runs 70), UART pins vs the
   header silkscreen, whether the C5's BOOT strap is GPIO28 on the XIAO.
 
