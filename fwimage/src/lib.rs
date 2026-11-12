@@ -16,5 +16,6 @@
 pub mod esprom;
 pub mod image;
 pub mod layout;
+pub mod mdns;
 pub mod receiver;
 pub mod settings;

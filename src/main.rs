@@ -10,6 +10,7 @@
 
 mod board;
 mod fw;
+mod mdns;
 mod netdev;
 mod node;
 mod settings;
@@ -119,7 +120,7 @@ async fn main(spawner: Spawner) {
     let (device, eth_runner) = embassy_net_wiznet::new(mac, WIZ_STATE.init(WiznetState::new()), spi_dev, int, rst).await.unwrap();
     spawner.spawn(ethernet_task(eth_runner).unwrap());
 
-    static RESOURCES: StaticCell<StackResources<{ web::WEB_TASK_POOL_SIZE + 2 }>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<{ web::WEB_TASK_POOL_SIZE + 3 }>> = StaticCell::new();
     let net_config = match net_boot {
         state::NetConfig::Dhcp => embassy_net::Config::dhcpv4(Default::default()),
         state::NetConfig::Static { address, prefix, gateway, dns } => {
@@ -140,6 +141,7 @@ async fn main(spawner: Spawner) {
     // --- OFT Protocol.
     spawner.spawn(web::status_tick_task(timer).unwrap());
     spawner.spawn(web::net_watch_task(timer, stack).unwrap());
+    spawner.spawn(mdns::mdns_task(timer, stack).unwrap());
     let adc = embassy_rp::adc::Adc::new(p.ADC, Irqs, Default::default());
     spawner.spawn(web::temp_task(timer, adc, embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR)).unwrap());
     for id in 0..web::WEB_TASK_POOL_SIZE {

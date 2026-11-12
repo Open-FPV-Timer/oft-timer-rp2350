@@ -168,6 +168,11 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
   protocol, host-tested). About two minutes for the firmware at 115200 baud. The C5's
   bootloader loses an answer every few seconds for a reason not yet found; the Timer starts
   a new write session at that point each time. Progress and a diagnosis at `GET`.
+- `mdns.rs`: announces `<id>._oft._tcp.local.` with the same TXT keys as `oftd` (`id`, `fw`,
+  `proto`, `seats`, `nodes`, `level`) and answers for `<id>.local`, so
+  `http://oft-a867.local:7270/` works where the client resolves `.local` names. The
+  messages are built in `fwimage/src/mdns.rs` (host-tested). IPv4 only, no name-conflict
+  probing (the name comes from the chip id).
 - `netdev.rs`: nothing is queued for sending while the Ethernet link is down. Without this
   the W6300's send buffer fills while unplugged and the cable is never noticed again.
 - `fw.rs`: firmware update over Ethernet on the boot ROM's A/B partitions: `POST /oft/v1/fw/timer`,
@@ -175,7 +180,7 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 
 ## Not yet
 
-- mDNS `_oft._tcp`, status LED, a settable Timer name.
+- Status LED, a settable Timer name.
 - A friendlier built-in page. Today's page grew out of bench diagnostics: every control on
   one screen, engineering terms, no guidance. It needs a plain setup flow (seats and
   channels, levels, save), a clear at-a-glance health view, and the diagnostics and firmware
