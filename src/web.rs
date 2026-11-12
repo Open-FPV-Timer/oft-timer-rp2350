@@ -3,7 +3,7 @@
 
 use crate::board::OFT_PORT;
 use crate::fw::{Fw, Other};
-use crate::state::{Config, Event, SeatConfig, ThresholdConfig, Timer, MAX_SEATS, TRACE_DT_US};
+use crate::state::{Config, Event, NetConfig, NetNow, Saved, SeatConfig, ThresholdConfig, Timer, MAX_SEATS, TRACE_DT_US};
 use core::fmt::Write as _;
 use embassy_net::Stack;
 use heapless::{String, Vec};
@@ -78,6 +78,7 @@ struct StatusJson {
     uptime_s: u64,
     time_us: u64,
     temp_c: Option<f32>,
+    timer_temp_c: Option<f32>,
     dropped: u32,
     clock_err_us: Option<f64>,
     clock_synced: bool,
@@ -93,6 +94,9 @@ struct SeatConfigJson {
     seat: u8,
     freq_mhz: u16,
     enabled: bool,
+    /// This seat's own threshold; absent = the shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    threshold: Option<ThresholdJson>,
 }
 
 /// `{"mode":"auto","snr_enter":..,"hysteresis":..}` or `{"mode":"manual","enter":..,"exit":..}`.
@@ -110,8 +114,27 @@ struct ThresholdJson {
     exit: Option<i16>,
 }
 
+impl From<ThresholdConfig> for ThresholdJson {
+    fn from(t: ThresholdConfig) -> Self {
+        match t {
+            ThresholdConfig::Auto { snr_enter, hysteresis } => ThresholdJson { mode: String::try_from("auto").unwrap(), snr_enter: Some(snr_enter), hysteresis: Some(hysteresis), enter: None, exit: None },
+            ThresholdConfig::Manual { enter, exit } => ThresholdJson { mode: String::try_from("manual").unwrap(), snr_enter: None, hysteresis: None, enter: Some(enter), exit: Some(exit) },
+        }
+    }
+}
+
+impl ThresholdJson {
+    fn into_threshold(&self) -> Result<ThresholdConfig, &'static str> {
+        match self.mode.as_str() {
+            "auto" => Ok(ThresholdConfig::Auto { snr_enter: self.snr_enter.ok_or("snr_enter required")?, hysteresis: self.hysteresis.ok_or("hysteresis required")? }),
+            "manual" => Ok(ThresholdConfig::Manual { enter: self.enter.ok_or("enter required")?, exit: self.exit.ok_or("exit required")? }),
+            _ => Err("threshold.mode must be auto or manual"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
-struct ConfigJson {
+pub(crate) struct ConfigJson {
     seats: Vec<SeatConfigJson, MAX_SEATS>,
     seats_per_node: u8,
     threshold: ThresholdJson,
@@ -125,13 +148,9 @@ impl From<&Config> for ConfigJson {
     fn from(c: &Config) -> Self {
         let mut seats = Vec::new();
         for s in c.seats.iter().flatten() {
-            let _ = seats.push(SeatConfigJson { seat: s.seat, freq_mhz: s.freq_mhz, enabled: s.enabled });
+            let _ = seats.push(SeatConfigJson { seat: s.seat, freq_mhz: s.freq_mhz, enabled: s.enabled, threshold: s.threshold.map(Into::into) });
         }
-        let threshold = match c.threshold {
-            ThresholdConfig::Auto { snr_enter, hysteresis } => ThresholdJson { mode: String::try_from("auto").unwrap(), snr_enter: Some(snr_enter), hysteresis: Some(hysteresis), enter: None, exit: None },
-            ThresholdConfig::Manual { enter, exit } => ThresholdJson { mode: String::try_from("manual").unwrap(), snr_enter: None, hysteresis: None, enter: Some(enter), exit: Some(exit) },
-        };
-        Self { seats, seats_per_node: c.seats_per_node, threshold, min_lap_ms: c.min_lap_ms, exit_hold_ms: Some(c.exit_hold_ms) }
+        Self { seats, seats_per_node: c.seats_per_node, threshold: c.threshold.into(), min_lap_ms: c.min_lap_ms, exit_hold_ms: Some(c.exit_hold_ms) }
     }
 }
 
@@ -145,16 +164,132 @@ impl ConfigJson {
             if !(5000..=6200).contains(&s.freq_mhz) {
                 return Err("freq_mhz out of range");
             }
-            seats[s.seat as usize] = Some(SeatConfig { seat: s.seat, freq_mhz: s.freq_mhz, enabled: s.enabled });
+            let threshold = match &s.threshold {
+                Some(t) => Some(t.into_threshold()?),
+                None => None,
+            };
+            seats[s.seat as usize] = Some(SeatConfig { seat: s.seat, freq_mhz: s.freq_mhz, enabled: s.enabled, threshold });
         }
-        let t = &self.threshold;
-        let threshold = match t.mode.as_str() {
-            "auto" => ThresholdConfig::Auto { snr_enter: t.snr_enter.ok_or("snr_enter required")?, hysteresis: t.hysteresis.ok_or("hysteresis required")? },
-            "manual" => ThresholdConfig::Manual { enter: t.enter.ok_or("enter required")?, exit: t.exit.ok_or("exit required")? },
-            _ => return Err("threshold.mode must be auto or manual"),
-        };
+        let threshold = self.threshold.into_threshold()?;
         Ok(Config { seats, seats_per_node: self.seats_per_node.clamp(1, 8), threshold, min_lap_ms: self.min_lap_ms, exit_hold_ms: self.exit_hold_ms.unwrap_or(Config::default().exit_hold_ms).min(1000) })
     }
+}
+
+/// Network settings: `{"mode":"dhcp"}` or
+/// `{"mode":"static","address":"192.168.1.50","prefix":24,"gateway":"192.168.1.1"}`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct NetJson {
+    mode: String<8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<String<15>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefix: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gateway: Option<String<15>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dns: Option<String<15>>,
+}
+
+pub(crate) fn ip_text(a: [u8; 4]) -> String<15> {
+    let mut s = String::new();
+    let _ = write!(s, "{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+    s
+}
+
+fn ip_parse(s: &str) -> Option<[u8; 4]> {
+    s.parse::<core::net::Ipv4Addr>().ok().map(|a| a.octets())
+}
+
+impl From<NetConfig> for NetJson {
+    fn from(n: NetConfig) -> Self {
+        match n {
+            NetConfig::Dhcp => NetJson { mode: String::try_from("dhcp").unwrap(), address: None, prefix: None, gateway: None, dns: None },
+            NetConfig::Static { address, prefix, gateway, dns } => {
+                NetJson { mode: String::try_from("static").unwrap(), address: Some(ip_text(address)), prefix: Some(prefix), gateway: gateway.map(ip_text), dns: dns.map(ip_text) }
+            }
+        }
+    }
+}
+
+impl NetJson {
+    fn into_net(&self) -> Result<NetConfig, &'static str> {
+        match self.mode.as_str() {
+            "dhcp" => Ok(NetConfig::Dhcp),
+            "static" => {
+                let address = self.address.as_deref().and_then(ip_parse).ok_or("address must be an IPv4 address like 192.168.1.50")?;
+                let prefix = self.prefix.ok_or("prefix required (24 for a 255.255.255.0 mask)")?;
+                if !(8..=30).contains(&prefix) {
+                    return Err("prefix must be 8..30");
+                }
+                let host_bits = u32::from_be_bytes(address) & (u32::MAX >> prefix);
+                if address[0] == 0 || address[0] >= 224 || address[0] == 127 || host_bits == 0 || host_bits == u32::MAX >> prefix {
+                    return Err("address is not usable as a host address on that network");
+                }
+                let opt = |s: &Option<String<15>>, what: &'static str| match s.as_deref() {
+                    None | Some("") => Ok(None),
+                    Some(t) => ip_parse(t).map(Some).ok_or(what),
+                };
+                Ok(NetConfig::Static { address, prefix, gateway: opt(&self.gateway, "gateway must be an IPv4 address")?, dns: opt(&self.dns, "dns must be an IPv4 address")? })
+            }
+            _ => Err("mode must be dhcp or static"),
+        }
+    }
+}
+
+/// Validate a fixed address given as text (the USB console's way in).
+#[cfg_attr(not(feature = "usb-console"), allow(dead_code))]
+pub(crate) fn parse_net(address: &str, prefix: u8, gateway: Option<&str>) -> Result<NetConfig, &'static str> {
+    let text = |s: &str| String::<15>::try_from(s).map_err(|_| "address must be an IPv4 address like 192.168.1.50");
+    NetJson { mode: String::try_from("static").unwrap(), address: Some(text(address)?), prefix: Some(prefix), gateway: gateway.map(text).transpose()?, dns: None }.into_net()
+}
+
+/// What the settings sectors hold.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SavedJson {
+    #[serde(default)]
+    config: Option<ConfigJson>,
+    #[serde(default)]
+    network: Option<NetJson>,
+}
+
+impl From<&Saved> for SavedJson {
+    fn from(s: &Saved) -> Self {
+        SavedJson { config: s.config.as_ref().map(ConfigJson::from), network: Some(s.net.into()) }
+    }
+}
+
+impl SavedJson {
+    /// Parts that do not validate fall back to their defaults, one by one.
+    pub(crate) fn into_saved(self) -> Saved {
+        Saved { config: self.config.and_then(|c| c.into_config().ok()), net: self.network.and_then(|n| n.into_net().ok()).unwrap_or_default() }
+    }
+}
+
+#[derive(Serialize)]
+struct NetNowJson {
+    address: String<15>,
+    prefix: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway: Option<String<15>>,
+}
+
+/// `GET /network`: the saved settings, what this boot is using, and the address right now.
+#[derive(Serialize)]
+struct NetStateJson {
+    saved: NetJson,
+    /// "dhcp", "static", or "dhcp (recovery jumper)".
+    using: &'static str,
+    now: Option<NetNowJson>,
+    /// The saved settings differ from what this boot started with.
+    restart_needed: bool,
+}
+
+#[derive(Serialize)]
+struct SaveStateJson {
+    /// A power-on config is stored.
+    saved: bool,
+    /// The config in use is the stored one.
+    current_is_saved: bool,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +331,7 @@ fn status_json(t: &Timer) -> StatusJson {
             uptime_s: now / 1_000_000,
             time_us: now,
             temp_c: i.node_temp_dc.map(|t| t as f32 / 10.0),
+            timer_temp_c: i.timer_temp_dc.map(|t| t as f32 / 10.0),
             dropped: i.host.dropped_samples.wrapping_add(i.dropped_frames),
             clock_err_us: clock.is_synced().then(|| clock.residual_us()),
             clock_synced: clock.is_synced(),
@@ -256,13 +392,16 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
         "],\"capabilities\":{{\"crossings\":{{\"algorithms\":[\"edge_mid\"],\"replay\":{},\"fields\":[\"t_enter\",\"t_exit\",\"peak\",\"snr\"]}},\
          \"samples.stream\":{{\"rate_hz\":{},\"decimate\":[1,2,5,10,20,50]}},\
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
-         \"config\":{{\"persist\":false,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seats_per_node\":true,\"exit_hold_ms\":true}},\
-         \"time\":{{\"sync\":[\"sync\",\"ping\"]}},\
+         \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seats_per_node\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true}},\
+         \"network\":{{\"static\":true}},\
+         \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
          \"fw.update\":{{\"nodes\":[],\"self\":{}}}}}}}",
         crate::state::CROSSING_REPLAY,
         rate,
         crate::state::TRACE_LEN as u64 * TRACE_DT_US / 1_000_000,
         1_000_000 / TRACE_DT_US,
+        // Present when this build has the serial console on the USB-C port.
+        if cfg!(feature = "usb-console") { "\"usb.console\":{}," } else { "" },
         self_update
     );
 }
@@ -280,7 +419,7 @@ impl RawJson {
         RawJson(StatusCode::new(code), s)
     }
     fn of<T: Serialize>(code: u16, v: &T) -> Self {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; BODY];
         let mut s = String::new();
         if let Ok(n) = serde_json_core::to_slice(v, &mut buf) {
             let _ = s.push_str(core::str::from_utf8(&buf[..n]).unwrap_or("{}"));
@@ -344,6 +483,75 @@ async fn put_config(State(AppState(t, _)): State<AppState>, picoserve::extract::
         }
         Err(e) => RawJson::error(400, e),
     }
+}
+
+fn save_state(t: &Timer) -> RawJson {
+    RawJson::of(200, &t.with(|i| SaveStateJson { saved: i.saved.config.is_some(), current_is_saved: i.saved.config == Some(i.config) }))
+}
+
+async fn get_config_save(State(AppState(t, _)): State<AppState>) -> RawJson {
+    save_state(t)
+}
+
+/// Keep the config in use as the power-on config.
+async fn post_config_save(State(AppState(t, fw)): State<AppState>) -> RawJson {
+    let saved = t.with(|i| Saved { config: Some(i.config), ..i.saved });
+    match crate::settings::save(t, fw, saved).await {
+        Ok(()) => save_state(t),
+        Err(e) => RawJson::error(500, e),
+    }
+}
+
+/// Forget the power-on config: the next start uses the built-in defaults.
+async fn delete_config_save(State(AppState(t, fw)): State<AppState>) -> RawJson {
+    let saved = t.with(|i| Saved { config: None, ..i.saved });
+    match crate::settings::save(t, fw, saved).await {
+        Ok(()) => save_state(t),
+        Err(e) => RawJson::error(500, e),
+    }
+}
+
+fn net_state(t: &Timer) -> RawJson {
+    RawJson::of(
+        200,
+        &t.with(|i| NetStateJson {
+            saved: i.saved.net.into(),
+            using: match (i.net_recovery, i.net_boot) {
+                (true, _) => "dhcp (recovery jumper)",
+                (false, NetConfig::Dhcp) => "dhcp",
+                (false, NetConfig::Static { .. }) => "static",
+            },
+            now: i.net_now.map(|n: NetNow| NetNowJson { address: ip_text(n.address), prefix: n.prefix, gateway: n.gateway.map(ip_text) }),
+            restart_needed: i.net_recovery || i.saved.net != i.net_boot,
+        }),
+    )
+}
+
+async fn get_network(State(AppState(t, _)): State<AppState>) -> RawJson {
+    net_state(t)
+}
+
+/// Save new network settings. They take effect at the next restart.
+async fn put_network(State(AppState(t, fw)): State<AppState>, picoserve::extract::Json(n): picoserve::extract::Json<NetJson>) -> RawJson {
+    let net = match n.into_net() {
+        Ok(net) => net,
+        Err(e) => return RawJson::error(400, e),
+    };
+    let saved = t.with(|i| Saved { net, ..i.saved });
+    match crate::settings::save(t, fw, saved).await {
+        Ok(()) => net_state(t),
+        Err(e) => RawJson::error(500, e),
+    }
+}
+
+async fn post_restart(State(AppState(_, fw)): State<AppState>) -> RawJson {
+    if fw.on_trial() {
+        return RawJson::error(409, "this firmware is still on trial after an update; wait for it to confirm");
+    }
+    fw.restart_soon();
+    let mut s = String::new();
+    let _ = s.push_str("{\"restarting\":true}");
+    RawJson(StatusCode::ACCEPTED, s)
 }
 
 async fn crossings(State(AppState(t, _)): State<AppState>, Query(q): Query<SinceQ>) -> RawJson {
@@ -569,7 +777,7 @@ async fn post_wiretest(State(state): State<AppState>) -> RawJson {
 }
 
 /// Set by `POST /oft/v1/fw/bootsel`; the status task restarts the board once the reply is out.
-static BOOTSEL_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) static BOOTSEL_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Restart into the ROM's USB bootloader (the `RP2350` drive), as holding BOOT while
 /// plugging in does, so a new UF2 can be copied on without reaching the button.
@@ -758,6 +966,9 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
         .route("/oft/v1/status", get(status))
         .route("/oft/v1/time", get(time))
         .route("/oft/v1/config", get(get_config).put(put_config))
+        .route("/oft/v1/config/save", get(get_config_save).post(post_config_save).delete(delete_config_save))
+        .route("/oft/v1/network", get(get_network).put(put_network))
+        .route("/oft/v1/restart", post(post_restart))
         .route("/oft/v1/crossings", get(crossings))
         .route("/oft/v1/samples", get(samples))
         .route("/oft/v1/stream", get(stream))
@@ -769,6 +980,39 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
     let mut tcp_tx = [0u8; 2048];
     let mut http = [0u8; 2048];
     picoserve::Server::new(&app, &CONFIG, &mut http).listen_and_serve(task_id, stack, OFT_PORT, &mut tcp_rx, &mut tcp_tx).await.into_never()
+}
+
+/// Read the RP2350's die temperature every two seconds (average of 8 conversions). The
+/// sensor is uncalibrated: good to a few degrees, which is enough to see a case run hot.
+#[embassy_executor::task]
+pub async fn temp_task(timer: &'static Timer, mut adc: embassy_rp::adc::Adc<'static, embassy_rp::adc::Async>, mut ch: embassy_rp::adc::Channel<'static>) {
+    loop {
+        let mut sum = 0u32;
+        let mut n = 0u32;
+        for _ in 0..8 {
+            if let Ok(v) = adc.read(&mut ch).await {
+                sum += v as u32;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            // 12-bit reading against 3.3 V; 0.706 V at 27 °C, -1.721 mV per °C (datasheet).
+            let volts = (sum as f32 / n as f32) * 3.3 / 4096.0;
+            let dc = (27.0 - (volts - 0.706) / 0.001721) * 10.0;
+            timer.with(|i| i.timer_temp_dc = Some(dc as i16));
+        }
+        embassy_time::Timer::after_secs(2).await;
+    }
+}
+
+/// Keep `net_now` in step with the address the network stack holds.
+#[embassy_executor::task]
+pub async fn net_watch_task(timer: &'static Timer, stack: Stack<'static>) {
+    loop {
+        let now = stack.config_v4().map(|c| NetNow { address: c.address.address().octets(), prefix: c.address.prefix_len(), gateway: c.gateway.map(|g| g.octets()) });
+        timer.with(|i| i.net_now = now);
+        embassy_time::Timer::after_secs(1).await;
+    }
 }
 
 /// Publish a `Status` event once a second for WebSocket subscribers.

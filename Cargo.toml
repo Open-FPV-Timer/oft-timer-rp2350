@@ -23,6 +23,7 @@ embassy-sync = "0.8.0"
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
 embassy-net-wiznet = "0.3.0"
+embassy-usb = { version = "0.6.0", optional = true, default-features = false, features = ["max-interface-count-2", "max-handler-count-2"] }
 embedded-hal-bus = { version = "0.3", features = ["async"] }
 embedded-io-async = "0.7.0"
 picoserve = { version = "0.20.1", features = ["embassy", "json", "ws"] }
@@ -35,6 +36,12 @@ critical-section = "1.1"
 cortex-m = { version = "0.7.6", features = ["inline-asm"] }
 cortex-m-rt = "0.7.0"
 panic-halt = "1.0"
+
+[features]
+default = ["usb-console"]
+# A serial console on the USB-C port (shows up as a COM port): address, status, recovery.
+# Build with --no-default-features for firmware with no USB stack at all.
+usb-console = ["dep:embassy-usb"]
 
 [profile.release]
 debug = 2

@@ -175,7 +175,31 @@ impl SlotFlash for SpareSlot<'_> {
     }
 }
 
+/// One of the two saved-settings sectors, read straight from flash (uncached window).
+pub fn settings_sector(copy: usize) -> &'static [u8] {
+    let at = XIP_NOTRANSLATE_BASE + oft_fwimage::settings::copy_offset(copy);
+    // Safety: 4 KiB of flash inside the 16 MB chip; reads of flash have no side effects, and
+    // the only writer (`Store::write_settings`) runs with everything else stopped.
+    unsafe { core::slice::from_raw_parts(at as *const u8, SECTOR) }
+}
+
 impl Store {
+    /// Save `payload` as the newest settings record, in the copy that is not the current
+    /// newest, so a power cut leaves the previous record readable.
+    pub fn write_settings(&mut self, payload: &[u8]) -> Result<(), &'static str> {
+        use oft_fwimage::settings::{choose, copy_offset, decode, encode, COPIES};
+        let seqs: [Option<u32>; COPIES] = core::array::from_fn(|c| decode(settings_sector(c)).map(|r| r.0));
+        let (_, target, seq) = choose(seqs);
+        encode(seq, payload, &mut self.bufs.sector).map_err(|_| "settings too large to save")?;
+        let at = copy_offset(target);
+        self.flash.blocking_erase(at, at + SECTOR_BYTES).map_err(|_| "flash erase failed")?;
+        self.flash.blocking_write(at, &self.bufs.sector).map_err(|_| "flash write failed")?;
+        match decode(settings_sector(target)) {
+            Some((s, p)) if s == seq && p == payload => Ok(()),
+            _ => Err("saved settings did not read back"),
+        }
+    }
+
     /// The slot to write an upload into. `running` must be the slot this firmware runs from.
     pub fn spare(&mut self, running: Slot) -> (SpareSlot<'_>, &mut Buffers) {
         (SpareSlot { flash: &mut self.flash, slot: running.other() }, &mut self.bufs)
@@ -299,6 +323,13 @@ impl Fw {
     pub fn switch_to(&self, target: Slot, info: &ImageInfo) {
         self.set_other(Other::Unconfirmed(info.build));
         self.schedule(1 + target.partition() as u8, SWITCH_DELAY);
+    }
+
+    /// Restart the Timer shortly (after the HTTP reply has left), into the same firmware.
+    pub fn restart_soon(&self) {
+        if !self.restarting() {
+            self.schedule(0, SWITCH_DELAY);
+        }
     }
 
     /// An upload failed after the spare slot was touched: whatever it held is gone.

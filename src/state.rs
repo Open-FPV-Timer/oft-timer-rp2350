@@ -23,12 +23,47 @@ pub struct SeatConfig {
     pub seat: u8,
     pub freq_mhz: u16,
     pub enabled: bool,
+    /// This seat's own threshold; `None` = the shared one.
+    pub threshold: Option<ThresholdConfig>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThresholdConfig {
     Auto { snr_enter: i16, hysteresis: i16 },
     Manual { enter: i16, exit: i16 },
+}
+
+impl From<ThresholdConfig> for Threshold {
+    fn from(t: ThresholdConfig) -> Self {
+        match t {
+            ThresholdConfig::Auto { snr_enter, hysteresis } => Threshold::Auto { snr_enter, hysteresis },
+            ThresholdConfig::Manual { enter, exit } => Threshold::Manual { enter, exit },
+        }
+    }
+}
+
+/// How the Timer gets its address. Read once at start-up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum NetConfig {
+    #[default]
+    Dhcp,
+    Static { address: [u8; 4], prefix: u8, gateway: Option<[u8; 4]>, dns: Option<[u8; 4]> },
+}
+
+/// What was read from flash at start-up, and what a save writes back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Saved {
+    /// The power-on config; `None` = the built-in defaults.
+    pub config: Option<Config>,
+    pub net: NetConfig,
+}
+
+/// The address in use right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NetNow {
+    pub address: [u8; 4],
+    pub prefix: u8,
+    pub gateway: Option<[u8; 4]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,7 +78,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let mut seats = [None; MAX_SEATS];
-        seats[0] = Some(SeatConfig { seat: 0, freq_mhz: 5800, enabled: true });
+        seats[0] = Some(SeatConfig { seat: 0, freq_mhz: 5800, enabled: true, threshold: None });
         Self { seats, seats_per_node: 8, threshold: ThresholdConfig::Auto { snr_enter: 150, hysteresis: 50 }, min_lap_ms: 2000, exit_hold_ms: 100 }
     }
 }
@@ -51,10 +86,7 @@ impl Default for Config {
 impl Config {
     pub fn detect(&self) -> DetectConfig {
         DetectConfig {
-            threshold: match self.threshold {
-                ThresholdConfig::Auto { snr_enter, hysteresis } => Threshold::Auto { snr_enter, hysteresis },
-                ThresholdConfig::Manual { enter, exit } => Threshold::Manual { enter, exit },
-            },
+            threshold: self.threshold.into(),
             min_lap_us: self.min_lap_ms as u64 * 1000,
             exit_hold_us: self.exit_hold_ms as u64 * 1000,
             ..DetectConfig::default()
@@ -73,6 +105,15 @@ impl Config {
             }
         }
         p
+    }
+
+    /// Give the host the shared detection settings and each seat's own threshold. Call
+    /// before `set_plan`, which builds the detectors from them.
+    pub fn apply_detection(&self, host: &mut NodeHost) {
+        host.set_detect_config(self.detect());
+        for (seat, s) in self.seats.iter().enumerate() {
+            host.set_seat_threshold(seat as u8, s.and_then(|s| s.threshold).map(Into::into));
+        }
     }
 
     pub fn enabled_seats(&self) -> impl Iterator<Item = &SeatConfig> {
@@ -158,6 +199,8 @@ pub struct Inner {
     pub traces: [Option<Trace>; MAX_SEATS],
     pub node_connected: bool,
     pub node_temp_dc: Option<i16>,
+    /// The RP2350's own die temperature, 0.1 °C.
+    pub timer_temp_dc: Option<i16>,
     pub last_node_rx_us: Option<u64>,
     /// Node-link frames that failed their checksum or framing.
     pub dropped_frames: u32,
@@ -168,6 +211,13 @@ pub struct Inner {
     pub wire_test: WireTest,
     /// Set by `set_config`; the node task sends the new plan and clears it.
     pub plan_dirty: bool,
+    /// What flash holds (kept in step by the save handlers).
+    pub saved: Saved,
+    /// The network settings this boot started with.
+    pub net_boot: NetConfig,
+    /// The recovery jumper was fitted at start-up, so a saved static address was ignored.
+    pub net_recovery: bool,
+    pub net_now: Option<NetNow>,
 }
 
 pub struct Timer {
@@ -191,9 +241,10 @@ pub enum Event {
 }
 
 impl Timer {
-    pub fn new(boot_id: u32, mac: [u8; 6]) -> Self {
-        let config = Config::default();
+    pub fn new(boot_id: u32, mac: [u8; 6], saved: Saved, net_boot: NetConfig, net_recovery: bool) -> Self {
+        let config = saved.config.unwrap_or_default();
         let mut host = NodeHost::new(config.detect());
+        config.apply_detection(&mut host);
         host.set_plan(config.plan());
         Self {
             inner: Mutex::new(RefCell::new(Inner {
@@ -204,12 +255,17 @@ impl Timer {
                 traces: [const { None }; MAX_SEATS],
                 node_connected: false,
                 node_temp_dc: None,
+                timer_temp_dc: None,
                 last_node_rx_us: None,
                 dropped_frames: 0,
                 uart_errors: 0,
                 node_status: None,
                 wire_test: WireTest { running: false, done: false, step: "", en_ok: None, en_ms: 0, boot_ok: None, recovered: None, recover_ms: 0 },
                 plan_dirty: true,
+                saved,
+                net_boot,
+                net_recovery,
+                net_now: None,
             })),
             events: PubSubChannel::new(),
             boot_id,
@@ -224,13 +280,19 @@ impl Timer {
 
     pub fn set_config(&self, config: Config) {
         self.with(|i| {
-            i.host.set_detect_config(config.detect());
-            i.host.set_plan(config.plan());
-            i.config = config;
-            for t in i.traces.iter_mut() {
-                *t = None;
+            config.apply_detection(&mut i.host);
+            // Only a change of seats or frequencies re-plans the Node. Re-planning restarts
+            // its sample stream (a gap of about 60 ms) and resets the detectors, so a change
+            // of levels alone must not do it.
+            let plan = config.plan();
+            if i.host.plan() != Some(&plan) {
+                i.host.set_plan(plan);
+                for t in i.traces.iter_mut() {
+                    *t = None;
+                }
+                i.plan_dirty = true;
             }
-            i.plan_dirty = true;
+            i.config = config;
         });
     }
 

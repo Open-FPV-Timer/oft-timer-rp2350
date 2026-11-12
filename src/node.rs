@@ -178,7 +178,8 @@ pub async fn node_rx_task(timer: &'static Timer, mut rx: BufferedUartRx) {
                         let _ = out.push(Event::Crossing { seq, c });
                     }
                     HostEvent::Status(s) => {
-                        *node_temp_dc = Some(s.temp_dc);
+                        // i16::MIN = the Node has no reading; 0 = Node firmware before it had a sensor.
+                                *node_temp_dc = (s.temp_dc != i16::MIN && s.temp_dc != 0).then_some(s.temp_dc);
                         *node_status = Some(s);
                     }
                     HostEvent::Synced => {}

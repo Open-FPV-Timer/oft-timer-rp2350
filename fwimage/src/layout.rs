@@ -5,7 +5,8 @@
 //! 0x001000  4 K    left erased (boot ROM "slot 1", a second partition table would go here)
 //! 0x002000  2 M    partition 0 = firmware slot A
 //! 0x202000  2 M    partition 1 = firmware slot B (linked to A as its "B" partition)
-//! 0x402000  ...    not partitioned, unused
+//! 0x402000  8 K    saved settings, two copies (`settings`); not a partition
+//! 0x404000  ...    unused
 //! ```
 //!
 //! `tools/uf2.py` writes the same numbers into the partition table; `LAYOUT_REV` is in the

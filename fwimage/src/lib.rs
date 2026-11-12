@@ -4,6 +4,7 @@
 //! - [`layout`]: where the two firmware slots live in flash and how to tell which one is running.
 //! - [`image`]: what a valid Timer firmware image looks like (the boot ROM's "block loop" with
 //!   a SHA-256 over the whole image) and the checks that decide whether to accept one.
+//! - [`settings`]: where saved settings live in flash and the power-cut-safe record format.
 //! - [`receiver`]: the order in which an upload is written to the spare slot, chosen so that
 //!   stopping at any point leaves the running firmware as the one the boot ROM picks.
 //!
@@ -15,3 +16,4 @@
 pub mod image;
 pub mod layout;
 pub mod receiver;
+pub mod settings;

@@ -57,7 +57,8 @@ How it works. The RP2350 boot ROM does the switching; there is no bootloader of 
 0x001000  4 K   erased (the boot ROM's second partition-table slot)
 0x002000  2 M   slot A (partition 0)
 0x202000  2 M   slot B (partition 1, the "B" partner of A)
-0x402000  ...   unused
+0x402000  8 K   saved settings, two copies (not a partition; a USB install leaves them alone)
+0x404000  ...   unused
 ```
 
 The image is linked at `0x10000000` and runs from either slot: the boot ROM maps the slot it
@@ -129,6 +130,25 @@ W6300: SPI0 SCK GP18, MOSI GP19, MISO GP16, CS GP17, RST GP20, INT GP21 (Wavesha
 `DEV_Config.h`). Board extras not used yet: WS2812 on GP25, USB detect GP24, PoE detect
 GP23, VSYS ADC GP29. All pins are in `src/board.rs`.
 
+## Fixed address and the way back
+
+Set a fixed address under **Network** on the Timer's page; it applies at the next restart.
+If the address turns out wrong and the Timer cannot be reached: fit a jumper between header
+pins 12 (GP9) and 13 (GND) and power it up. With the jumper fitted it ignores the saved
+address and uses DHCP for that start; save working settings, then remove the jumper.
+
+## USB serial console (optional)
+
+With the `usb-console` feature (on by default) the USB-C port is a serial port while the
+Timer runs: open it in PuTTY or any terminal (speed does not matter), press Enter, type
+`help`. Commands: `status`, `net`, `net dhcp`, `net static <address>/<prefix> [gateway]`,
+`restart`, `bootsel`. It is a second way back from a wrong fixed address. The OFT Protocol
+is not served there.
+
+`cargo build --release --no-default-features` builds firmware with no USB stack at all.
+`/info` lists `usb.console` in `capabilities` when the build has it. The USB IDs are the
+pid.codes test pair (1209:0001): get real ones before boards go to other people.
+
 ## What it does
 
 - `node.rs`: decodes Node-link frames (COBS + CRC-16) into `oft_core::NodeHost`, sends `Plan`
@@ -137,6 +157,10 @@ GP23, VSYS ADC GP29. All pins are in `src/board.rs`.
   30 s trace per seat for `/samples`; a pub/sub channel feeding WebSocket clients.
 - `web.rs`: picoserve HTTP + WebSocket: `/oft/v1/{info,config,status,time,crossings,samples,
   stream}`. Conformance level **L2** plus reduced-rate history (the hello advertises what it keeps).
+- `settings.rs`: saved settings in two flash sectors after the firmware slots (kept across
+  updates; a save always goes to the older copy, so a power cut keeps the previous one).
+  `POST`/`DELETE /oft/v1/config/save` for the power-on config, `GET`/`PUT /oft/v1/network`
+  for DHCP or a fixed address, `POST /oft/v1/restart`. A save stops timing for about 50 ms.
 - `fw.rs`: firmware update over Ethernet on the boot ROM's A/B partitions: `POST /oft/v1/fw/timer`,
   the trial after an update, the `fw.update` capability (`self`).
 
@@ -144,7 +168,7 @@ GP23, VSYS ADC GP29. All pins are in `src/board.rs`.
 
 - Flashing the C5 from the Timer (the EN/BOOT lines are wired for it; the ESP ROM loader
   protocol is not written).
-- mDNS `_oft._tcp`, persistent config, status LED.
+- mDNS `_oft._tcp`, status LED, a settable Timer name.
 - First-boot checks: SPI clock (starts at 30 MHz; Waveshare runs 70), UART pins vs the
   header silkscreen, whether the C5's BOOT strap is GPIO28 on the XIAO.
 
