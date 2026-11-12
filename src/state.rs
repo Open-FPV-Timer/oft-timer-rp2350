@@ -69,7 +69,6 @@ pub struct NetNow {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
     pub seats: [Option<SeatConfig>; MAX_SEATS],
-    pub seats_per_node: u8,
     pub threshold: ThresholdConfig,
     pub min_lap_ms: u32,
     pub exit_hold_ms: u32,
@@ -79,7 +78,7 @@ impl Default for Config {
     fn default() -> Self {
         let mut seats = [None; MAX_SEATS];
         seats[0] = Some(SeatConfig { seat: 0, freq_mhz: 5800, enabled: true, threshold: None });
-        Self { seats, seats_per_node: 8, threshold: ThresholdConfig::Auto { snr_enter: 150, hysteresis: 50 }, min_lap_ms: 2000, exit_hold_ms: 100 }
+        Self { seats, threshold: ThresholdConfig::Auto { snr_enter: 150, hysteresis: 50 }, min_lap_ms: 2000, exit_hold_ms: 100 }
     }
 }
 
@@ -95,14 +94,9 @@ impl Config {
 
     pub fn plan(&self) -> Plan {
         let mut p = Plan::with(0, 0, GAIN_AUTO);
-        let mut n = 0;
+        // One Node: every enabled seat goes to it (a Plan holds as many as there are seats).
         for s in self.seats.iter().flatten().filter(|s| s.enabled) {
-            if n >= self.seats_per_node.max(1) {
-                break;
-            }
-            if p.push(s.seat, s.freq_mhz).is_ok() {
-                n += 1;
-            }
+            let _ = p.push(s.seat, s.freq_mhz);
         }
         p
     }
