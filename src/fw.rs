@@ -183,7 +183,30 @@ pub fn settings_sector(copy: usize) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(at as *const u8, SECTOR) }
 }
 
+/// The Node firmware scratch area, read straight from flash (uncached window).
+pub fn node_store() -> &'static [u8] {
+    let at = XIP_NOTRANSLATE_BASE + layout::NODE_STORE_OFFSET;
+    // Safety: as `settings_sector`; the area lies inside the 16 MB chip.
+    unsafe { core::slice::from_raw_parts(at as *const u8, layout::NODE_STORE_BYTES as usize) }
+}
+
 impl Store {
+    /// The 4 KiB working buffer, for filling a sector before `write_node_sector`.
+    pub fn sector_buf(&mut self) -> &mut [u8; SECTOR] {
+        &mut self.bufs.sector
+    }
+
+    /// Erase sector `index` of the Node firmware scratch area and write the working buffer
+    /// to it.
+    pub fn write_node_sector(&mut self, index: u32) -> Result<(), &'static str> {
+        let at = layout::NODE_STORE_OFFSET + index * SECTOR_BYTES;
+        if at + SECTOR_BYTES > layout::NODE_STORE_OFFSET + layout::NODE_STORE_BYTES {
+            return Err("the file is too large for the Timer to hold");
+        }
+        self.flash.blocking_erase(at, at + SECTOR_BYTES).map_err(|_| "flash erase failed")?;
+        self.flash.blocking_write(at, &self.bufs.sector).map_err(|_| "flash write failed")
+    }
+
     /// Save `payload` as the newest settings record, in the copy that is not the current
     /// newest, so a power cut leaves the previous record readable.
     pub fn write_settings(&mut self, payload: &[u8]) -> Result<(), &'static str> {

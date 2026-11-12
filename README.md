@@ -161,14 +161,25 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
   updates; a save always goes to the older copy, so a power cut keeps the previous one).
   `POST`/`DELETE /oft/v1/config/save` for the power-on config, `GET`/`PUT /oft/v1/network`
   for DHCP or a fixed address, `POST /oft/v1/restart`. A save stops timing for about 50 ms.
+- Node firmware through the Timer: `POST /oft/v1/fw/node?offset=65536` with the Node's
+  `firmware.bin` (or the bootloader at 0x2000, the partition table at 0x8000). The Timer
+  stores and checks the file, restarts the C5 into its ROM bootloader with EN and BOOT,
+  writes it over the Node link's UART and compares an MD5 (`fwimage/src/esprom.rs` has the
+  protocol, host-tested). About two minutes for the firmware at 115200 baud. The C5's
+  bootloader loses an answer every few seconds for a reason not yet found; the Timer starts
+  a new write session at that point each time. Progress and a diagnosis at `GET`.
+- `netdev.rs`: nothing is queued for sending while the Ethernet link is down. Without this
+  the W6300's send buffer fills while unplugged and the cable is never noticed again.
 - `fw.rs`: firmware update over Ethernet on the boot ROM's A/B partitions: `POST /oft/v1/fw/timer`,
   the trial after an update, the `fw.update` capability (`self`).
 
 ## Not yet
 
-- Flashing the C5 from the Timer (the EN/BOOT lines are wired for it; the ESP ROM loader
-  protocol is not written).
 - mDNS `_oft._tcp`, status LED, a settable Timer name.
+- A friendlier built-in page. Today's page grew out of bench diagnostics: every control on
+  one screen, engineering terms, no guidance. It needs a plain setup flow (seats and
+  channels, levels, save), a clear at-a-glance health view, and the diagnostics and firmware
+  tools moved out of the way.
 - First-boot checks: SPI clock (starts at 30 MHz; Waveshare runs 70), UART pins vs the
   header silkscreen, whether the C5's BOOT strap is GPIO28 on the XIAO.
 

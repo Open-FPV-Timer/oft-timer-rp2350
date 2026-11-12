@@ -191,6 +191,24 @@ pub struct WireTest {
     pub recover_ms: u32,
 }
 
+/// Progress and result of writing firmware to the Node (`node::node_ctl_task`).
+#[derive(Clone, Copy, Default)]
+pub struct NodeFlash {
+    pub running: bool,
+    pub done: bool,
+    pub ok: bool,
+    pub step: &'static str,
+    pub error: &'static str,
+    /// Where in the Node's flash, and how much.
+    pub offset: u32,
+    pub total: u32,
+    pub written: u32,
+    pub baud: u32,
+    /// The Node came back on the Node link afterwards.
+    pub returned: Option<bool>,
+    pub seconds: u32,
+}
+
 pub struct Inner {
     pub host: NodeHost,
     pub config: Config,
@@ -209,6 +227,7 @@ pub struct Inner {
     /// The Node's last `Status` message.
     pub node_status: Option<oft_nodelink::msg::Status>,
     pub wire_test: WireTest,
+    pub node_flash: NodeFlash,
     /// Set by `set_config`; the node task sends the new plan and clears it.
     pub plan_dirty: bool,
     /// What flash holds (kept in step by the save handlers).
@@ -261,6 +280,7 @@ impl Timer {
                 uart_errors: 0,
                 node_status: None,
                 wire_test: WireTest { running: false, done: false, step: "", en_ok: None, en_ms: 0, boot_ok: None, recovered: None, recover_ms: 0 },
+                node_flash: NodeFlash { running: false, done: false, ok: false, step: "", error: "", offset: 0, total: 0, written: 0, baud: 0, returned: None, seconds: 0 },
                 plan_dirty: true,
                 saved,
                 net_boot,

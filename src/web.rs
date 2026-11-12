@@ -13,7 +13,10 @@ use picoserve::response::{Content, IntoResponse, Json, Response, StatusCode};
 use picoserve::routing::{get, get_service, post};
 use serde::{Deserialize, Serialize};
 
-pub const WEB_TASK_POOL_SIZE: usize = 4;
+/// Connections served at once. A WebSocket holds one for as long as it is open, and a browser
+/// showing the Timer's page opens several more in a burst; when every task is busy a new
+/// connection is refused outright. Four was too few for the page plus one other client.
+pub const WEB_TASK_POOL_SIZE: usize = 8;
 
 /// Capacity of a JSON body built in place. The largest is the WebSocket `hello` with eight
 /// seats enabled, a little over 1 KiB.
@@ -395,7 +398,7 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
          \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seats_per_node\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true}},\
          \"network\":{{\"static\":true}},\
          \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
-         \"fw.update\":{{\"nodes\":[],\"self\":{}}}}}}}",
+         \"fw.update\":{{\"nodes\":[\"uart\"],\"self\":{}}}}}}}",
         crate::state::CROSSING_REPLAY,
         rate,
         crate::state::TRACE_LEN as u64 * TRACE_DT_US / 1_000_000,
@@ -766,12 +769,17 @@ async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
 /// Protocol: it resets the Node three times and stops timing while it runs.
 async fn post_wiretest(State(state): State<AppState>) -> RawJson {
     let t = state.0;
-    if t.with(|i| i.wire_test.running) {
-        return RawJson::error(409, "the wiring test is already running");
-    }
-    t.with(|i| {
+    // Check and claim in one step, so the test and a Node firmware write cannot both start.
+    let claimed = t.with(|i| {
+        if i.wire_test.running || i.node_flash.running {
+            return false;
+        }
         i.wire_test = crate::state::WireTest { running: true, step: "starting", ..Default::default() };
+        true
     });
+    if !claimed {
+        return RawJson::error(409, "the Node is already being tested or written; wait for that to finish");
+    }
     crate::node::WIRE_TEST.signal(());
     get_wiretest(State(state)).await
 }
@@ -934,6 +942,195 @@ async fn fw_receive<R: picoserve::io::Read>(fw: &'static Fw, request: &mut picos
     }
 }
 
+/// `POST /oft/v1/fw/node?offset=65536&baud=115200`: firmware for the Node, written to it over
+/// the Node link's UART through the C5's ROM bootloader (EN and BOOT wires needed). The body
+/// is the raw file for that offset: `firmware.bin` at 0x10000 (the default),
+/// `bootloader.bin` at 0x2000, `partitions.bin` at 0x8000. It is stored in the Timer's flash
+/// first and checked; the transfer then runs on its own, with progress at `GET`.
+/// Bench convenience, not part of the OFT Protocol: anyone on the network can call it.
+struct NodeUpload;
+
+fn node_flash_json(t: &Timer) -> RawJson {
+    let (f, connected) = t.with(|i| (i.node_flash, i.node_connected));
+    let mut s: String<BODY> = String::new();
+    let _ = write!(
+        s,
+        "{{\"supported\":true,\"running\":{},\"done\":{},\"ok\":{},\"step\":\"{}\",\"error\":\"{}\",\"offset\":{},\"bytes\":{},\"written\":{},\"baud\":{},\"seconds\":{},\"node_connected\":{},\"max_bytes\":{}",
+        f.running,
+        f.done,
+        f.ok,
+        f.step,
+        f.error,
+        f.offset,
+        f.total,
+        f.written,
+        f.baud,
+        f.seconds,
+        connected,
+        oft_fwimage::layout::NODE_STORE_BYTES
+    );
+    let _ = s.push_str(",\"diag\":\"");
+    crate::node::FLASH_DIAG.lock(|d| {
+        let _ = s.push_str(d.borrow().as_str());
+    });
+    match f.returned {
+        Some(r) => {
+            let _ = write!(s, "\",\"returned\":{}}}", r);
+        }
+        None => {
+            let _ = s.push_str("\",\"returned\":null}");
+        }
+    }
+    RawJson::ok(s)
+}
+
+async fn get_fw_node(State(AppState(t, _)): State<AppState>) -> RawJson {
+    node_flash_json(t)
+}
+
+/// `offset` and `baud` from the query string, with their defaults.
+fn node_query(query: Option<&str>) -> Result<(u32, u32), &'static str> {
+    let (mut offset, mut baud) = (oft_fwimage::esprom::C5_APP_OFFSET, 115_200u32);
+    for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let n = match v.strip_prefix("0x") {
+            Some(h) => u32::from_str_radix(h, 16),
+            None => v.parse::<u32>(),
+        };
+        match (k, n) {
+            ("offset", Ok(n)) => offset = n,
+            ("baud", Ok(n)) => baud = n,
+            ("offset" | "baud", Err(_)) => return Err("offset and baud must be numbers"),
+            _ => {}
+        }
+    }
+    if ![115_200, 230_400, 460_800, 921_600].contains(&baud) {
+        return Err("baud must be 115200, 230400, 460800 or 921600");
+    }
+    Ok((offset, baud))
+}
+
+async fn node_receive<R: picoserve::io::Read>(t: &'static Timer, fw: &'static Fw, request: &mut picoserve::request::Request<'_, R>) -> Result<RawJson, R::Error> {
+    use md5::Digest as _;
+    use oft_fwimage::esprom::check_image;
+    use oft_fwimage::layout::{NODE_STORE_BYTES, SECTOR_BYTES};
+    use picoserve::io::Read as _;
+    const SECTOR: usize = SECTOR_BYTES as usize;
+    let len = request.body_connection.content_length();
+    let query = node_query(request.parts.query().map(|q| q.0));
+    let mut reader = request.body_connection.body().reader().with_different_timeout(embassy_time::Duration::from_secs(60));
+    let refuse = |code: u16, m: &'static str| RawJson::error(code, m);
+    let (offset, baud) = match query {
+        Ok(q) => q,
+        Err(m) => {
+            drain(&mut reader).await?;
+            return Ok(refuse(400, m));
+        }
+    };
+    if len > NODE_STORE_BYTES as usize {
+        // Not worth reading: the connection closes after the reply.
+        return Ok(refuse(413, "the file is too large for the Timer to hold"));
+    }
+    if t.with(|i| i.node_flash.running || i.wire_test.running) {
+        drain(&mut reader).await?;
+        return Ok(refuse(409, "the Node is already being written or tested; wait for that to finish"));
+    }
+    if fw.restarting() {
+        drain(&mut reader).await?;
+        return Ok(refuse(409, "the Timer is about to restart"));
+    }
+    let Ok(mut store) = fw.store.try_lock() else {
+        drain(&mut reader).await?;
+        return Ok(refuse(409, "a firmware upload to the Timer is in progress"));
+    };
+    let mut md5 = md5::Md5::new();
+    let (mut got, mut fill, mut sector) = (0usize, 0usize, 0u32);
+    let mut checked = false;
+    let mut failure: Option<&'static str> = None;
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        if failure.is_some() {
+            continue;
+        }
+        md5.update(&chunk[..n]);
+        got += n;
+        let mut rest = &chunk[..n];
+        while !rest.is_empty() && failure.is_none() {
+            let take = rest.len().min(SECTOR - fill);
+            store.sector_buf()[fill..fill + take].copy_from_slice(&rest[..take]);
+            fill += take;
+            rest = &rest[take..];
+            // Look at the start of the file before anything is written anywhere.
+            if !checked && (fill >= 16 || got == len) {
+                checked = true;
+                if let Err(e) = check_image(offset, len as u32, &store.sector_buf()[..fill], NODE_STORE_BYTES) {
+                    failure = Some(e.as_str());
+                    break;
+                }
+            }
+            if fill == SECTOR {
+                if let Err(e) = store.write_node_sector(sector) {
+                    failure = Some(e);
+                }
+                sector += 1;
+                fill = 0;
+            }
+        }
+    }
+    if failure.is_none() && got != len {
+        failure = Some("the upload ended early");
+    }
+    if failure.is_none() && !checked {
+        failure = Some(oft_fwimage::esprom::ImageError::Empty.as_str());
+    }
+    if failure.is_none() && fill > 0 {
+        store.sector_buf()[fill..].fill(0xff);
+        if let Err(e) = store.write_node_sector(sector) {
+            failure = Some(e);
+        }
+    }
+    drop(store);
+    if let Some(m) = failure {
+        return Ok(refuse(400, m));
+    }
+    let mut digest = [0u8; 16];
+    digest.copy_from_slice(&md5.finalize());
+    // Claim the flasher. Two uploads cannot both get here: the store lock was held until now
+    // and this check-and-set does not yield.
+    let claimed = t.with(|i| {
+        if i.node_flash.running || i.wire_test.running {
+            return false;
+        }
+        i.node_flash = crate::state::NodeFlash { running: true, step: "queued", offset, total: len as u32, baud, ..Default::default() };
+        true
+    });
+    if !claimed {
+        return Ok(refuse(409, "the Node is already being written or tested; wait for that to finish"));
+    }
+    crate::node::NODE_FLASH.signal(crate::node::NodeJob { offset, len: len as u32, md5: digest, baud });
+    let mut reply = node_flash_json(t);
+    reply.0 = StatusCode::ACCEPTED;
+    Ok(reply)
+}
+
+impl picoserve::routing::RequestHandlerService<AppState> for NodeUpload {
+    async fn call_request_handler_service<R: picoserve::io::Read, W: picoserve::response::ResponseWriter<Error = R::Error>>(
+        &self,
+        state: &AppState,
+        (): (),
+        mut request: picoserve::request::Request<'_, R>,
+        response_writer: W,
+    ) -> Result<picoserve::ResponseSent, W::Error> {
+        let reply = node_receive(state.0, state.1, &mut request).await?;
+        let connection = request.body_connection.finalize().await?;
+        reply.write_to(connection, response_writer).await
+    }
+}
+
 impl picoserve::routing::RequestHandlerService<AppState> for FwUpload {
     async fn call_request_handler_service<R: picoserve::io::Read, W: picoserve::response::ResponseWriter<Error = R::Error>>(
         &self,
@@ -974,6 +1171,7 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
         .route("/oft/v1/stream", get(stream))
         .route("/oft/v1/fw/bootsel", post(fw_bootsel))
         .route("/oft/v1/fw/timer", get(get_fw_timer).post_service(FwUpload))
+        .route("/oft/v1/fw/node", get(get_fw_node).post_service(NodeUpload))
         .route("/oft/v1/node/wiretest", get(get_wiretest).post(post_wiretest))
         .with_state(AppState(timer, fw));
     let mut tcp_rx = [0u8; 1024];

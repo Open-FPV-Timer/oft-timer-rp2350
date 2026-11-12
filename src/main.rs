@@ -3,11 +3,14 @@
 //! Tasks: W6300 Ethernet runner, network stack, Node UART rx/tx, SYNC pulses, a pool of
 //! HTTP/WebSocket servers, and a status tick. All timing logic lives in `oft-core`.
 
+// The router's type nests once per route.
+#![recursion_limit = "256"]
 #![no_std]
 #![no_main]
 
 mod board;
 mod fw;
+mod netdev;
 mod node;
 mod settings;
 mod state;
@@ -58,7 +61,7 @@ async fn ethernet_task(runner: Runner<'static, W6300, SpiDev, Input<'static>, Ou
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, Device<'static>>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static, netdev::LinkGated<Device<'static>>>) -> ! {
     runner.run().await
 }
 
@@ -131,7 +134,7 @@ async fn main(spawner: Spawner) {
             })
         }
     };
-    let (stack, net_runner) = embassy_net::new(device, net_config, RESOURCES.init(StackResources::new()), seed());
+    let (stack, net_runner) = embassy_net::new(netdev::LinkGated(device), net_config, RESOURCES.init(StackResources::new()), seed());
     spawner.spawn(net_task(net_runner).unwrap());
 
     // --- OFT Protocol.

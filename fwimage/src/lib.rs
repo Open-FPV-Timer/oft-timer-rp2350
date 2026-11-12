@@ -13,6 +13,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod esprom;
 pub mod image;
 pub mod layout;
 pub mod receiver;

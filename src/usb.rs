@@ -34,12 +34,14 @@ const PACKET: usize = 64;
 
 const HELP: &str = "\
 Commands:\r\n\
-  status                              what the Timer is doing\r\n\
-  net                                 address now and the saved network settings\r\n\
-  net dhcp                            save: get the address from DHCP\r\n\
-  net static <address>/<prefix> [gw]  save a fixed address, e.g. net static 192.168.1.50/24 192.168.1.1\r\n\
-  restart                             restart the Timer (network changes apply then)\r\n\
-  bootsel                             restart as the RP2350 USB drive, to install firmware\r\n\
+  status       what the Timer is doing\r\n\
+  net          address now and the saved network settings\r\n\
+  net dhcp     save: get the address from DHCP\r\n\
+  net static <address>/<prefix> [gateway]\r\n\
+               save a fixed address, e.g.\r\n\
+               net static 192.168.1.50/24 192.168.1.1\r\n\
+  restart      restart the Timer (network changes apply then)\r\n\
+  bootsel      restart as the RP2350 USB drive, to install firmware\r\n\
   help\r\n";
 
 pub fn start(spawner: Spawner, usb: Peri<'static, USB>, timer: &'static Timer, fw: &'static Fw) {

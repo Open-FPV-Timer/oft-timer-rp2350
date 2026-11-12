@@ -7,6 +7,8 @@
 //! 0x202000  2 M    partition 1 = firmware slot B (linked to A as its "B" partition)
 //! 0x402000  8 K    saved settings, two copies (`settings`); not a partition
 //! 0x404000  ...    unused
+//! 0x410000  2 M    Node firmware waiting to be written to a Node (`NODE_STORE_*`); scratch
+//! 0x610000  ...    unused
 //! ```
 //!
 //! `tools/uf2.py` writes the same numbers into the partition table; `LAYOUT_REV` is in the
@@ -29,6 +31,10 @@ pub const SLOT_B_OFFSET: u32 = SLOT_A_OFFSET + SLOT_BYTES;
 pub const MAX_IMAGE_BYTES: u32 = SLOT_BYTES - SECTOR_BYTES;
 /// Smallest image accepted: the first sector is handled separately from the rest.
 pub const MIN_IMAGE_BYTES: u32 = 2 * SECTOR_BYTES;
+
+/// Scratch space for a Node firmware file between its upload and its transfer to the Node.
+pub const NODE_STORE_OFFSET: u32 = 0x0041_0000;
+pub const NODE_STORE_BYTES: u32 = 0x0020_0000;
 
 /// Bumped when the numbers above change.
 pub const LAYOUT_REV: u32 = 1;
