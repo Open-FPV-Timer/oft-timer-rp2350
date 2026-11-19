@@ -72,13 +72,15 @@ pub struct Config {
     pub threshold: ThresholdConfig,
     pub min_lap_ms: u32,
     pub exit_hold_ms: u32,
+    /// Pass window, ms. 0 = off.
+    pub pass_window_ms: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut seats = [None; MAX_SEATS];
         seats[0] = Some(SeatConfig { seat: 0, freq_mhz: 5800, enabled: true, threshold: None });
-        Self { seats, threshold: ThresholdConfig::Auto { snr_enter: 150, hysteresis: 50 }, min_lap_ms: 2000, exit_hold_ms: 100 }
+        Self { seats, threshold: ThresholdConfig::Auto { snr_enter: 150, hysteresis: 50 }, min_lap_ms: 2000, exit_hold_ms: 100, pass_window_ms: 0 }
     }
 }
 
@@ -88,6 +90,7 @@ impl Config {
             threshold: self.threshold.into(),
             min_lap_us: self.min_lap_ms as u64 * 1000,
             exit_hold_us: self.exit_hold_ms as u64 * 1000,
+            pass_window_us: self.pass_window_ms as u64 * 1000,
             ..DetectConfig::default()
         }
     }

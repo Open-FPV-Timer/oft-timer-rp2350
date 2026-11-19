@@ -149,6 +149,9 @@ pub(crate) struct ConfigJson {
     /// Absent (older clients) means the default.
     #[serde(default)]
     exit_hold_ms: Option<u32>,
+    /// Absent (older clients, settings saved by older firmware) means off.
+    #[serde(default)]
+    pass_window_ms: u32,
 }
 
 impl From<&Config> for ConfigJson {
@@ -157,7 +160,7 @@ impl From<&Config> for ConfigJson {
         for s in c.seats.iter().flatten() {
             let _ = seats.push(SeatConfigJson { seat: s.seat, freq_mhz: s.freq_mhz, enabled: s.enabled, threshold: s.threshold.map(Into::into) });
         }
-        Self { seats, seats_per_node: None, threshold: c.threshold.into(), min_lap_ms: c.min_lap_ms, exit_hold_ms: Some(c.exit_hold_ms) }
+        Self { seats, seats_per_node: None, threshold: c.threshold.into(), min_lap_ms: c.min_lap_ms, exit_hold_ms: Some(c.exit_hold_ms), pass_window_ms: c.pass_window_ms }
     }
 }
 
@@ -178,7 +181,10 @@ impl ConfigJson {
             seats[s.seat as usize] = Some(SeatConfig { seat: s.seat, freq_mhz: s.freq_mhz, enabled: s.enabled, threshold });
         }
         let threshold = self.threshold.into_threshold()?;
-        Ok(Config { seats, threshold, min_lap_ms: self.min_lap_ms, exit_hold_ms: self.exit_hold_ms.unwrap_or(Config::default().exit_hold_ms).min(1000) })
+        if self.pass_window_ms > 10_000 {
+            return Err("pass_window_ms must be 0..10000");
+        }
+        Ok(Config { seats, threshold, min_lap_ms: self.min_lap_ms, exit_hold_ms: self.exit_hold_ms.unwrap_or(Config::default().exit_hold_ms).min(1000), pass_window_ms: self.pass_window_ms })
     }
 }
 
@@ -399,7 +405,7 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
         "],\"capabilities\":{{\"crossings\":{{\"algorithms\":[\"edge_mid\"],\"replay\":{},\"fields\":[\"t_enter\",\"t_exit\",\"peak\",\"snr\"]}},\
          \"samples.stream\":{{\"rate_hz\":{},\"decimate\":[1,2,5,10,20,50]}},\
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
-         \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true}},\
+         \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true,\"pass_window_ms\":true}},\
          \"network\":{{\"static\":true}},\
          \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
          \"fw.update\":{{\"nodes\":[\"uart\"],\"self\":{}}}}}}}",
