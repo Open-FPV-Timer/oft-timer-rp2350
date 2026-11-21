@@ -13,7 +13,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
-pub mod esprom;
+/// The ESP32 ROM bootloader protocol: shared with `oftd`, so it lives in the `oft` workspace.
+pub use oft_esprom as esprom;
 pub mod image;
 pub mod layout;
 pub mod mdns;
