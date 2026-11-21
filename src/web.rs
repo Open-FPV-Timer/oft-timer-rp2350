@@ -55,6 +55,8 @@ fn crossing_json(seq: u64, c: &oft_core::Crossing) -> CrossingJson {
 #[derive(Serialize)]
 struct SeatStatusJson {
     seat: u8,
+    /// Id of the Node that serves the seat; null until a Node has introduced itself.
+    node: Option<String<16>>,
     rate_hz: u32,
     rssi: Option<i16>,
     floor: Option<i16>,
@@ -374,6 +376,11 @@ struct SamplesQ {
 fn status_json(t: &Timer) -> StatusJson {
     t.with(|i| {
         let clock = i.host.clock();
+        let node: Option<String<16>> = i.host.hello().map(|h| {
+            let mut id = String::new();
+            let _ = write!(id, "{:012x}", h.chip_id);
+            id
+        });
         let mut seats = Vec::new();
         for s in i.config.enabled_seats() {
             let det = i.host.detector(s.seat);
@@ -381,6 +388,7 @@ fn status_json(t: &Timer) -> StatusJson {
             let tr = i.traces.get(s.seat as usize).and_then(|t| t.as_ref());
             let _ = seats.push(SeatStatusJson {
                 seat: s.seat,
+                node: node.clone(),
                 rate_hz: tr.map(|t| t.rate_hz).unwrap_or(0),
                 rssi: tr.map(|t| t.last_rssi),
                 floor: det.and_then(|d| d.floor()),
