@@ -441,8 +441,8 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
     if let Some(h) = h {
         let _ = write!(
             out,
-            "{{\"id\":\"{:012x}\",\"chip\":\"esp32c5\",\"fw\":\"{}.{}.{}\",\"range_mhz\":[{},{}],\"max_seats\":{},\"link\":\"uart\"}}",
-            h.chip_id, h.fw[0], h.fw[1], h.fw[2], h.freq_min_mhz, h.freq_max_mhz, h.max_seats
+            "{{\"id\":\"{:012x}\",\"chip\":\"{}\",\"fw\":\"{}.{}.{}\",\"range_mhz\":[{},{}],\"max_seats\":{},\"link\":\"uart\"}}",
+            h.chip_id, h.chip_name(), h.fw[0], h.fw[1], h.fw[2], h.freq_min_mhz, h.freq_max_mhz, h.max_seats
         );
     }
     let _ = write!(out, "],\"seats\":[");
