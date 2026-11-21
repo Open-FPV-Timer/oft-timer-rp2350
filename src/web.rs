@@ -1,7 +1,7 @@
 //! The OFT Protocol (spec §6) over picoserve: `/oft/v1/{info,config,status,time,crossings,
 //! samples,stream}`. JSON is built with serde-json-core into fixed buffers.
 
-use crate::board::OFT_PORT;
+use crate::board::{Pins, OFT_PORT, OUT_PINS, RX_PINS, TX_PINS};
 use crate::fw::{Fw, Other};
 use crate::state::{Config, Event, NetConfig, NetNow, Saved, SeatConfig, ThresholdConfig, Timer, MAX_SEATS, TRACE_DT_US};
 use core::fmt::Write as _;
@@ -256,6 +256,29 @@ pub(crate) fn parse_net(address: &str, prefix: u8, gateway: Option<&str>) -> Res
     NetJson { mode: String::try_from("static").unwrap(), address: Some(text(address)?), prefix: Some(prefix), gateway: gateway.map(text).transpose()?, dns: None }.into_net()
 }
 
+/// The Node's pins as GPIO numbers: the body of `PUT /pins`, and how they are stored.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub(crate) struct PinsJson {
+    tx: u8,
+    rx: u8,
+    sync: u8,
+    en: u8,
+    boot: u8,
+}
+
+impl From<Pins> for PinsJson {
+    fn from(p: Pins) -> Self {
+        PinsJson { tx: p.tx, rx: p.rx, sync: p.sync, en: p.en, boot: p.boot }
+    }
+}
+
+impl PinsJson {
+    fn into_pins(self) -> Result<Pins, &'static str> {
+        let p = Pins { tx: self.tx, rx: self.rx, sync: self.sync, en: self.en, boot: self.boot };
+        p.check().map(|()| p)
+    }
+}
+
 /// What the settings sectors hold.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SavedJson {
@@ -263,19 +286,45 @@ pub(crate) struct SavedJson {
     config: Option<ConfigJson>,
     #[serde(default)]
     network: Option<NetJson>,
+    /// Absent (settings saved by older firmware, or never changed) means the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pins: Option<PinsJson>,
 }
 
 impl From<&Saved> for SavedJson {
     fn from(s: &Saved) -> Self {
-        SavedJson { config: s.config.as_ref().map(ConfigJson::from), network: Some(s.net.into()) }
+        SavedJson { config: s.config.as_ref().map(ConfigJson::from), network: Some(s.net.into()), pins: (s.pins != Pins::default()).then(|| s.pins.into()) }
     }
 }
 
 impl SavedJson {
     /// Parts that do not validate fall back to their defaults, one by one.
     pub(crate) fn into_saved(self) -> Saved {
-        Saved { config: self.config.and_then(|c| c.into_config().ok()), net: self.network.and_then(|n| n.into_net().ok()).unwrap_or_default() }
+        Saved {
+            config: self.config.and_then(|c| c.into_config().ok()),
+            net: self.network.and_then(|n| n.into_net().ok()).unwrap_or_default(),
+            pins: self.pins.and_then(|p| p.into_pins().ok()).unwrap_or_default(),
+        }
     }
+}
+
+#[derive(Serialize)]
+struct PinChoicesJson {
+    tx: &'static [u8],
+    rx: &'static [u8],
+    /// For `sync`, `en` and `boot`.
+    out: &'static [u8],
+}
+
+/// `GET /pins`: the saved pins, the ones this boot is using, and what each may be.
+#[derive(Serialize)]
+struct PinsStateJson {
+    saved: PinsJson,
+    using: PinsJson,
+    defaults: PinsJson,
+    choices: PinChoicesJson,
+    /// The saved pins differ from what this boot started with.
+    restart_needed: bool,
 }
 
 #[derive(Serialize)]
@@ -407,6 +456,7 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
          \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true,\"pass_window_ms\":true}},\
          \"network\":{{\"static\":true}},\
+         \"pins\":{{}},\
          \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
          \"fw.update\":{{\"nodes\":[\"uart\"],\"self\":{}}}}}}}",
         crate::state::CROSSING_REPLAY,
@@ -553,6 +603,36 @@ async fn put_network(State(AppState(t, fw)): State<AppState>, picoserve::extract
     let saved = t.with(|i| Saved { net, ..i.saved });
     match crate::settings::save(t, fw, saved).await {
         Ok(()) => net_state(t),
+        Err(e) => RawJson::error(500, e),
+    }
+}
+
+fn pins_state(t: &Timer) -> RawJson {
+    RawJson::of(
+        200,
+        &t.with(|i| PinsStateJson {
+            saved: i.saved.pins.into(),
+            using: i.pins_boot.into(),
+            defaults: Pins::default().into(),
+            choices: PinChoicesJson { tx: &TX_PINS, rx: &RX_PINS, out: &OUT_PINS },
+            restart_needed: i.saved.pins != i.pins_boot,
+        }),
+    )
+}
+
+async fn get_pins(State(AppState(t, _)): State<AppState>) -> RawJson {
+    pins_state(t)
+}
+
+/// Save new Node pins. They take effect at the next restart.
+async fn put_pins(State(AppState(t, fw)): State<AppState>, picoserve::extract::Json(p): picoserve::extract::Json<PinsJson>) -> RawJson {
+    let pins = match p.into_pins() {
+        Ok(pins) => pins,
+        Err(e) => return RawJson::error(400, e),
+    };
+    let saved = t.with(|i| Saved { pins, ..i.saved });
+    match crate::settings::save(t, fw, saved).await {
+        Ok(()) => pins_state(t),
         Err(e) => RawJson::error(500, e),
     }
 }
@@ -1175,6 +1255,7 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
         .route("/oft/v1/config", get(get_config).put(put_config))
         .route("/oft/v1/config/save", get(get_config_save).post(post_config_save).delete(delete_config_save))
         .route("/oft/v1/network", get(get_network).put(put_network))
+        .route("/oft/v1/pins", get(get_pins).put(put_pins))
         .route("/oft/v1/restart", post(post_restart))
         .route("/oft/v1/crossings", get(crossings))
         .route("/oft/v1/samples", get(samples))

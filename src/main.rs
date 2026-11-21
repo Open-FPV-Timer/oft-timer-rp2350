@@ -24,10 +24,11 @@ use embassy_net::{Stack, StackResources};
 use embassy_net_wiznet::chip::W6300;
 use embassy_net_wiznet::{Device, Runner, State as WiznetState};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pull};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, SPI0, UART1};
 use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig, TxPin};
+use embassy_rp::Peri;
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use panic_halt as _;
@@ -72,6 +73,41 @@ fn seed() -> u64 {
     rng.next_u64()
 }
 
+/// A plain output on header GPIO `n`.
+///
+/// The pin is taken by number, not from `Peripherals`: `Pins::check` only lets through
+/// header GPIOs that nothing else in this firmware touches, each used once.
+fn output(n: u8, level: Level) -> Output<'static> {
+    Output::new(unsafe { AnyPin::steal(n) }, level)
+}
+
+/// UART1 on the saved pins. embassy names UART pins by type, so every allowed pin is
+/// spelled out here: the same lists as `board::TX_PINS` and `board::RX_PINS`.
+fn node_uart(uart: Peri<'static, UART1>, pins: board::Pins, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
+    use embassy_rp::peripherals::{PIN_10, PIN_11, PIN_22, PIN_26, PIN_27, PIN_4, PIN_5, PIN_6, PIN_7, PIN_8};
+    fn on<T: TxPin<UART1>>(uart: Peri<'static, UART1>, tx: Peri<'static, T>, rx: u8, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
+        // Safety: as for `output`.
+        unsafe {
+            match rx {
+                7 => BufferedUart::new(uart, tx, PIN_7::steal(), Irqs, tx_buf, rx_buf, cfg),
+                11 => BufferedUart::new(uart, tx, PIN_11::steal(), Irqs, tx_buf, rx_buf, cfg),
+                27 => BufferedUart::new(uart, tx, PIN_27::steal(), Irqs, tx_buf, rx_buf, cfg),
+                _ => BufferedUart::new(uart, tx, PIN_5::steal(), Irqs, tx_buf, rx_buf, cfg),
+            }
+        }
+    }
+    unsafe {
+        match pins.tx {
+            6 => on(uart, PIN_6::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            8 => on(uart, PIN_8::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            10 => on(uart, PIN_10::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            22 => on(uart, PIN_22::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            26 => on(uart, PIN_26::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            _ => on(uart, PIN_4::steal(), pins.rx, tx_buf, rx_buf, cfg),
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -93,19 +129,21 @@ async fn main(spawner: Spawner) {
     drop(recovery_pin);
     let timer: &'static Timer = TIMER.init(Timer::new(seed() as u32, mac, saved, net_boot, net_recovery));
 
-    // --- Node: EN/BOOT lines and the UART.
-    let mut en = Output::new(p.PIN_7, Level::High);
-    let mut boot = Output::new(p.PIN_8, Level::High);
+    // --- Node: EN/BOOT lines and the UART, on the saved pins (checked when they were saved
+    // and again when read back; `settings::load` falls back to the defaults).
+    let pins = saved.pins;
+    let mut en = output(pins.en, Level::High);
+    let mut boot = output(pins.boot, Level::High);
     node::reset_node(&mut en, &mut boot, false).await;
     static UART_TX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
     static UART_RX_BUF: StaticCell<[u8; 2048]> = StaticCell::new();
     let mut ucfg = UartConfig::default();
     ucfg.baudrate = board::node::BAUD;
-    let uart = BufferedUart::new(p.UART1, p.PIN_4, p.PIN_5, Irqs, UART_TX_BUF.init([0; 1024]), UART_RX_BUF.init([0; 2048]), ucfg);
+    let uart = node_uart(p.UART1, pins, UART_TX_BUF.init([0; 1024]), UART_RX_BUF.init([0; 2048]), ucfg);
     let (uart_tx, uart_rx) = uart.split();
     spawner.spawn(node::node_rx_task(timer, uart_rx).unwrap());
     spawner.spawn(node::node_tx_task(timer, uart_tx).unwrap());
-    spawner.spawn(node::sync_task(timer, Output::new(p.PIN_6, Level::Low)).unwrap());
+    spawner.spawn(node::sync_task(timer, output(pins.sync, Level::Low)).unwrap());
     spawner.spawn(node::node_ctl_task(timer, en, boot).unwrap());
 
     // --- Ethernet: W6300 on SPI0.

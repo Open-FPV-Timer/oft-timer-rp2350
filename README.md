@@ -126,9 +126,16 @@ OFT_FW_IMAGE=../oft-timer.bin cargo test --target x86_64-unknown-linux-gnu   # a
 | Node EN (reset) | GP7 → | EN / RST |
 | Node BOOT | GP8 → | BOOT strap |
 
+These are the default pins. The five Node pins are a saved setting: the **Advanced** page
+(or `PUT /oft/v1/pins`) moves them, applied at the next restart, so a board wired
+differently runs the same firmware. UART1 can transmit on GP4, GP6, GP8, GP10, GP22 or
+GP26 and receive on GP5, GP7, GP11 or GP27; SYNC, EN and BOOT take any header GPIO but GP9
+(the recovery jumper). Wrong pins cannot lock you out: the page stays reachable and the
+Node stays silent until they match the wiring.
+
 W6300: SPI0 SCK GP18, MOSI GP19, MISO GP16, CS GP17, RST GP20, INT GP21 (Waveshare's
 `DEV_Config.h`). Board extras not used yet: WS2812 on GP25, USB detect GP24, PoE detect
-GP23, VSYS ADC GP29. All pins are in `src/board.rs`.
+GP23, VSYS ADC GP29. All pins, and which ones the Node may use, are in `src/board.rs`.
 
 ## Fixed address and the way back
 

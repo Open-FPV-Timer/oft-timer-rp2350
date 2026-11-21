@@ -56,6 +56,7 @@ pub struct Saved {
     /// The power-on config; `None` = the built-in defaults.
     pub config: Option<Config>,
     pub net: NetConfig,
+    pub pins: crate::board::Pins,
 }
 
 /// The address in use right now.
@@ -234,6 +235,8 @@ pub struct Inner {
     /// The recovery jumper was fitted at start-up, so a saved static address was ignored.
     pub net_recovery: bool,
     pub net_now: Option<NetNow>,
+    /// The Node pins this boot started with.
+    pub pins_boot: crate::board::Pins,
 }
 
 pub struct Timer {
@@ -283,6 +286,7 @@ impl Timer {
                 net_boot,
                 net_recovery,
                 net_now: None,
+                pins_boot: saved.pins,
             })),
             events: PubSubChannel::new(),
             boot_id,
