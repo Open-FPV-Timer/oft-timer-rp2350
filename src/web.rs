@@ -90,6 +90,8 @@ struct StatusJson {
     node_connected: bool,
     link: LinkJson,
     seats: Vec<SeatStatusJson, MAX_SEATS>,
+    /// WebSocket streams open now.
+    clients: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -409,6 +411,7 @@ fn status_json(t: &Timer) -> StatusJson {
                 node_gain: i.node_status.map(|s| s.gain_index),
             },
             seats,
+            clients: WS_CLIENTS.load(portable_atomic::Ordering::Relaxed),
         }
     })
 }
@@ -735,9 +738,27 @@ fn one() -> u32 {
 
 struct Stream(&'static Timer, &'static Fw);
 
+/// WebSocket streams open now (`clients` in `/status`).
+static WS_CLIENTS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+/// Counts one stream for as long as it lives, however it ends.
+struct ClientCount;
+impl ClientCount {
+    fn new() -> Self {
+        WS_CLIENTS.fetch_add(1, portable_atomic::Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for ClientCount {
+    fn drop(&mut self) {
+        WS_CLIENTS.fetch_sub(1, portable_atomic::Ordering::Relaxed);
+    }
+}
+
 impl ws::WebSocketCallback for Stream {
     async fn run<R: picoserve::io::Read, W: picoserve::io::Write<Error = R::Error>>(self, mut rx: ws::SocketRx<R>, mut tx: ws::SocketTx<W>) -> Result<(), W::Error> {
         let t = self.0;
+        let _counted = ClientCount::new();
         let mut sub = t.events.subscriber().unwrap();
         let mut want_crossings = false;
         let mut want_samples: Option<SubSamples> = None;
