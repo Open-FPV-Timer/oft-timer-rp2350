@@ -187,6 +187,17 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 
 ## Not yet
 
+- **A watchdog in normal running.** The firmware halts on a panic (`panic-halt`) and the
+  watchdog only runs while a network update is on trial, so a crash or a hang leaves the
+  Timer dead until its power is cycled. Seen once (2026-11-21): the Timer went off the
+  network while receiving a firmware upload, about 20 minutes after start and just after a
+  `bench/conformance.py` run, and stayed off until it was power-cycled; the same upload
+  then worked twice, each within a minute of a restart. The cause was not found: the update
+  logic takes that same file correctly on the host (`fwimage` tests). A watchdog fed from
+  the executor would have turned that into a restart. It should also record why the Timer
+  restarted (watchdog or power) and show it in `/status`, so a hang like that one leaves a
+  trace. Until then, a Timer that stops answering needs a power cycle; an interrupted
+  update is safe, since the boot ROM keeps starting the old firmware.
 - Status LED.
 - Renaming the Timer. Today `/info` says "OFT Timer" for every Timer, and the id
   (`oft-a867`) comes from the chip. A name set from the page and the USB console, saved
