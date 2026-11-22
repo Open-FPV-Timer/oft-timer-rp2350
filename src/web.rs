@@ -94,6 +94,15 @@ struct StatusJson {
     seats: Vec<SeatStatusJson, MAX_SEATS>,
     /// WebSocket streams open now.
     clients: u32,
+    config_rev: u32,
+    /// The claim that holds control.
+    control: Option<HolderJson>,
+}
+
+#[derive(Serialize)]
+struct HolderJson {
+    id: u32,
+    name: String<{ oft_core::control::NAME_MAX }>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -420,6 +429,8 @@ fn status_json(t: &Timer) -> StatusJson {
             },
             seats,
             clients: WS_CLIENTS.load(portable_atomic::Ordering::Relaxed),
+            config_rev: i.config_rev,
+            control: i.control.holder().map(|h| HolderJson { id: h.id, name: String::try_from(h.name.as_str()).unwrap_or_default() }),
         }
     })
 }
@@ -468,6 +479,7 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
          \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true,\"pass_window_ms\":true}},\
          \"network\":{{\"static\":true}},\
          \"pins\":{{}},\
+         \"control\":{{}},\
          \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
          \"fw.update\":{{\"nodes\":[\"uart\"],\"self\":{}}}}}}}",
         crate::state::CROSSING_REPLAY,
@@ -526,6 +538,146 @@ impl IntoResponse for RawJson {
     }
 }
 
+// ------------------------------------------------------------------ control (spec §6.6)
+
+fn control_changed(t: &Timer) {
+    t.events.immediate_publisher().publish_immediate(Event::Control);
+}
+
+/// Whether a request may change the Timer: while a claim holds control, only with its key
+/// in the `OFT-Control` header. The refusal is the reply to send.
+fn may_write(t: &Timer, parts: &picoserve::request::RequestParts<'_>) -> Result<(), RawJson> {
+    let key = parts.headers().get("OFT-Control").and_then(|v| v.as_str().ok());
+    let (expired, holder) = t.with(|i| {
+        let expired = i.control.expire(crate::state::now_us());
+        (expired, if i.control.allows(key) { None } else { i.control.holder().map(|h| h.name) })
+    });
+    if expired {
+        control_changed(t);
+    }
+    match holder {
+        None => Ok(()),
+        Some(name) => {
+            let mut msg: String<64> = String::new();
+            let _ = write!(msg, "controlled by {}", name.as_str());
+            Err(RawJson::error(423, &msg))
+        }
+    }
+}
+
+/// An argument of every handler that changes the Timer: the request is refused before the
+/// handler runs unless it may write.
+struct Writer;
+
+impl<'r> picoserve::extract::FromRequestParts<'r, AppState> for Writer {
+    type Rejection = RawJson;
+    async fn from_request_parts(state: &'r AppState, parts: &picoserve::request::RequestParts<'r>) -> Result<Self, RawJson> {
+        may_write(state.0, parts).map(|()| Writer)
+    }
+}
+
+/// The reply of `/control`: the standing claims, oldest first.
+fn control_json(t: &Timer) -> RawJson {
+    let mut s: String<BODY> = String::new();
+    t.with(|i| {
+        let holder = i.control.holder().map(|h| h.id);
+        let _ = s.push_str("{\"holder\":");
+        opt_u32(holder, &mut s);
+        let _ = s.push_str(",\"claims\":[");
+        for (k, c) in i.control.claims().enumerate() {
+            let _ = write!(
+                s,
+                "{}{{\"id\":{},\"name\":\"{}\",\"holds\":{},\"connected\":{}}}",
+                if k > 0 { "," } else { "" },
+                c.id,
+                c.name.as_str(),
+                Some(c.id) == holder,
+                c.away_until.is_none()
+            );
+        }
+        let _ = s.push_str("]}");
+    });
+    RawJson::ok(s)
+}
+
+async fn get_control(State(AppState(t, _)): State<AppState>) -> RawJson {
+    control_json(t)
+}
+
+/// `{"grant": <claim id>}` or `{"grant": null}`. The field must be there: an empty body
+/// must not free control by accident.
+#[derive(Deserialize)]
+struct GrantJson {
+    #[serde(default, deserialize_with = "present")]
+    grant: Option<Option<u32>>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(d).map(Some)
+}
+
+/// An argument of a handler that only the Timer's own page may call: a browser sends
+/// `Origin` with every POST, and for a page this Timer served it names the host the
+/// request went to. Pages from elsewhere cannot fake it, and other clients do not send it.
+struct OwnPage;
+
+impl<'r> picoserve::extract::FromRequestParts<'r, AppState> for OwnPage {
+    type Rejection = RawJson;
+    async fn from_request_parts(_: &'r AppState, parts: &picoserve::request::RequestParts<'r>) -> Result<Self, RawJson> {
+        let get = |name| parts.headers().get(name).and_then(|v| v.as_str().ok());
+        match (get("Origin"), get("Host")) {
+            (Some(origin), Some(host)) if oft_core::control::same_origin(origin, host) => Ok(OwnPage),
+            _ => Err(RawJson::error(403, oft_core::control::OWN_PAGE_ONLY)),
+        }
+    }
+}
+
+/// Hand control to a standing claim, or to nobody. Needs no key: it is the way back in
+/// when the holder is the wrong one. Only for the Timer's own page, so that no other
+/// client can take control for itself.
+async fn post_control(State(AppState(t, _)): State<AppState>, _: OwnPage, picoserve::extract::Json(g): picoserve::extract::Json<GrantJson>) -> RawJson {
+    let Some(grant) = g.grant else { return RawJson::error(400, "expected grant: a claim id or null") };
+    if t.with(|i| i.control.grant(grant)).is_err() {
+        return RawJson::error(404, "no such claim");
+    }
+    control_changed(t);
+    control_json(t)
+}
+
+/// Where control stands, for one stream: the holder, the stream's own claim, and the key
+/// if that claim is the holder.
+fn control_msg(t: &Timer, mine: Option<(u32, u32)>, out: &mut String<BODY>) {
+    out.clear();
+    t.with(|i| {
+        // Another stream may have taken the claim up since (it came back with the key).
+        let mine = mine.filter(|(id, owner)| i.control.get(*id).is_some_and(|c| c.owner == *owner)).map(|(id, _)| id);
+        let _ = out.push_str("{\"type\":\"control\",\"holder\":");
+        let _ = match i.control.holder() {
+            Some(h) => write!(out, "{{\"id\":{},\"name\":\"{}\"}}", h.id, h.name.as_str()),
+            None => write!(out, "null"),
+        };
+        let _ = out.push_str(",\"claim\":");
+        opt_u32(mine, out);
+        if let Some(h) = i.control.holder().filter(|h| Some(h.id) == mine) {
+            let _ = write!(out, ",\"key\":\"{}\"", core::str::from_utf8(&h.key_text()).unwrap_or(""));
+        }
+        let _ = out.push('}');
+    });
+}
+
+/// A stream's claim, ended when the stream is, however that happens. A holder keeps
+/// control for a while after its stream drops, to come back to.
+struct StreamClaim(&'static Timer, Option<(u32, u32)>);
+
+impl Drop for StreamClaim {
+    fn drop(&mut self) {
+        if let Some(mine) = self.1 {
+            self.0.with(|i| i.control.leave(mine, true, crate::state::now_us()));
+            control_changed(self.0);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ handlers
 
 async fn info(State(AppState(t, fw)): State<AppState>) -> RawJson {
@@ -549,7 +701,7 @@ async fn get_config(State(AppState(t, _)): State<AppState>) -> Json<ConfigJson> 
     Json(t.with(|i| ConfigJson::from(&i.config)))
 }
 
-async fn put_config(State(AppState(t, _)): State<AppState>, picoserve::extract::Json(c): picoserve::extract::Json<ConfigJson>) -> RawJson {
+async fn put_config(State(AppState(t, _)): State<AppState>, _: Writer, picoserve::extract::Json(c): picoserve::extract::Json<ConfigJson>) -> RawJson {
     match c.into_config() {
         Ok(cfg) => {
             t.set_config(cfg);
@@ -568,7 +720,7 @@ async fn get_config_save(State(AppState(t, _)): State<AppState>) -> RawJson {
 }
 
 /// Keep the config in use as the power-on config.
-async fn post_config_save(State(AppState(t, fw)): State<AppState>) -> RawJson {
+async fn post_config_save(State(AppState(t, fw)): State<AppState>, _: Writer) -> RawJson {
     let saved = t.with(|i| Saved { config: Some(i.config), ..i.saved });
     match crate::settings::save(t, fw, saved).await {
         Ok(()) => save_state(t),
@@ -577,7 +729,7 @@ async fn post_config_save(State(AppState(t, fw)): State<AppState>) -> RawJson {
 }
 
 /// Forget the power-on config: the next start uses the built-in defaults.
-async fn delete_config_save(State(AppState(t, fw)): State<AppState>) -> RawJson {
+async fn delete_config_save(State(AppState(t, fw)): State<AppState>, _: Writer) -> RawJson {
     let saved = t.with(|i| Saved { config: None, ..i.saved });
     match crate::settings::save(t, fw, saved).await {
         Ok(()) => save_state(t),
@@ -606,7 +758,7 @@ async fn get_network(State(AppState(t, _)): State<AppState>) -> RawJson {
 }
 
 /// Save new network settings. They take effect at the next restart.
-async fn put_network(State(AppState(t, fw)): State<AppState>, picoserve::extract::Json(n): picoserve::extract::Json<NetJson>) -> RawJson {
+async fn put_network(State(AppState(t, fw)): State<AppState>, _: Writer, picoserve::extract::Json(n): picoserve::extract::Json<NetJson>) -> RawJson {
     let net = match n.into_net() {
         Ok(net) => net,
         Err(e) => return RawJson::error(400, e),
@@ -636,7 +788,7 @@ async fn get_pins(State(AppState(t, _)): State<AppState>) -> RawJson {
 }
 
 /// Save new Node pins. They take effect at the next restart.
-async fn put_pins(State(AppState(t, fw)): State<AppState>, picoserve::extract::Json(p): picoserve::extract::Json<PinsJson>) -> RawJson {
+async fn put_pins(State(AppState(t, fw)): State<AppState>, _: Writer, picoserve::extract::Json(p): picoserve::extract::Json<PinsJson>) -> RawJson {
     let pins = match p.into_pins() {
         Ok(pins) => pins,
         Err(e) => return RawJson::error(400, e),
@@ -648,7 +800,7 @@ async fn put_pins(State(AppState(t, fw)): State<AppState>, picoserve::extract::J
     }
 }
 
-async fn post_restart(State(AppState(_, fw)): State<AppState>) -> RawJson {
+async fn post_restart(State(AppState(_, fw)): State<AppState>, _: Writer) -> RawJson {
     if fw.on_trial() {
         return RawJson::error(409, "this firmware is still on trial after an update; wait for it to confirm");
     }
@@ -727,6 +879,13 @@ struct SubMsg<'a> {
     samples: Option<SubSamples>,
     #[serde(default)]
     status: bool,
+    // `control` messages (spec §6.6).
+    #[serde(default)]
+    claim: Option<&'a str>,
+    #[serde(default)]
+    key: Option<&'a str>,
+    #[serde(default)]
+    release: bool,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -767,7 +926,9 @@ impl ws::WebSocketCallback for Stream {
     async fn run<R: picoserve::io::Read, W: picoserve::io::Write<Error = R::Error>>(self, mut rx: ws::SocketRx<R>, mut tx: ws::SocketTx<W>) -> Result<(), W::Error> {
         let t = self.0;
         let _counted = ClientCount::new();
-        let mut sub = t.events.subscriber().unwrap();
+        // One event subscription per stream; with all of them taken, say so and go.
+        let Ok(mut sub) = t.events.subscriber() else { return tx.close(Some((1013, "too many streams are open"))).await };
+        let mut claim = StreamClaim(t, None);
         let mut want_crossings = false;
         let mut want_samples: Option<SubSamples> = None;
         let mut want_status = false;
@@ -776,6 +937,8 @@ impl ws::WebSocketCallback for Stream {
         let mut body: String<BODY> = String::new();
 
         info_json(t, self.1.self_update(), true, &mut body);
+        tx.send_text(body.as_str()).await?;
+        control_msg(t, claim.1, &mut body);
         tx.send_text(body.as_str()).await?;
 
         let close = loop {
@@ -797,6 +960,23 @@ impl ws::WebSocketCallback for Stream {
                             want_status = m.status;
                             tx.send_text("{\"type\":\"ack\",\"for\":\"sub\"}").await?;
                         }
+                        // Every stream, this one included, hears the outcome as an event.
+                        Ok((m, _)) if m.kind == "control" && m.release => {
+                            if let Some(mine) = claim.1.take() {
+                                t.with(|i| i.control.leave(mine, false, crate::state::now_us()));
+                            }
+                            control_changed(t);
+                        }
+                        Ok((m, _)) if m.kind == "control" => match m.claim {
+                            Some(name) => match t.with(|i| i.control.claim(claim.1, name, m.key, crate::state::now_us() as u32)) {
+                                Ok(mine) => {
+                                    claim.1 = Some(mine);
+                                    control_changed(t);
+                                }
+                                Err(_) => tx.send_text("{\"type\":\"error\",\"code\":\"control_full\",\"msg\":\"this Timer has no room for another claim\"}").await?,
+                            },
+                            None => tx.send_text("{\"type\":\"error\",\"code\":\"bad_control\",\"msg\":\"expected claim or release\"}").await?,
+                        },
                         Ok((m, _)) if m.kind == "ping" => {
                             body.clear();
                             let _ = write!(body, "{{\"type\":\"pong\",\"time_us\":{}}}", crate::state::now_us());
@@ -843,8 +1023,13 @@ impl ws::WebSocketCallback for Stream {
                             tx.send_text(body.as_str()).await?;
                         }
                     }
+                    Event::Control => {
+                        control_msg(t, claim.1, &mut body);
+                        tx.send_text(body.as_str()).await?;
+                    }
                     Event::Status if want_status => {
-                        let mut buf = [0u8; 1024];
+                        // Eight seats with a holder's name come to about 1.3 KiB.
+                        let mut buf = [0u8; 1536];
                         if let Ok(n) = serde_json_core::to_slice(&status_json(t), &mut buf) {
                             tx.send_text(core::str::from_utf8(&buf[..n]).unwrap_or("{}")).await?;
                         }
@@ -886,7 +1071,7 @@ async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
 
 /// Start the Node wiring test (EN and BOOT lines). Bench diagnostic, not part of the OFT
 /// Protocol: it resets the Node three times and stops timing while it runs.
-async fn post_wiretest(State(state): State<AppState>) -> RawJson {
+async fn post_wiretest(State(state): State<AppState>, _: Writer) -> RawJson {
     let t = state.0;
     // Check and claim in one step, so the test and a Node firmware write cannot both start.
     let claimed = t.with(|i| {
@@ -909,7 +1094,7 @@ pub(crate) static BOOTSEL_REQUESTED: core::sync::atomic::AtomicBool = core::sync
 /// Restart into the ROM's USB bootloader (the `RP2350` drive), as holding BOOT while
 /// plugging in does, so a new UF2 can be copied on without reaching the button.
 /// Bench convenience, not part of the OFT Protocol: anyone on the network can call it.
-async fn fw_bootsel() -> RawJson {
+async fn fw_bootsel(_: Writer) -> RawJson {
     BOOTSEL_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
     let mut s = String::new();
     let _ = s.push_str("{\"ok\":true,\"msg\":\"restarting into USB boot mode\"}");
@@ -1244,7 +1429,10 @@ impl picoserve::routing::RequestHandlerService<AppState> for NodeUpload {
         mut request: picoserve::request::Request<'_, R>,
         response_writer: W,
     ) -> Result<picoserve::ResponseSent, W::Error> {
-        let reply = node_receive(state.0, state.1, &mut request).await?;
+        let reply = match may_write(state.0, &request.parts) {
+            Ok(()) => node_receive(state.0, state.1, &mut request).await?,
+            Err(refused) => refused,
+        };
         let connection = request.body_connection.finalize().await?;
         reply.write_to(connection, response_writer).await
     }
@@ -1258,7 +1446,10 @@ impl picoserve::routing::RequestHandlerService<AppState> for FwUpload {
         mut request: picoserve::request::Request<'_, R>,
         response_writer: W,
     ) -> Result<picoserve::ResponseSent, W::Error> {
-        let reply = fw_receive(state.1, &mut request).await?;
+        let reply = match may_write(state.0, &request.parts) {
+            Ok(()) => fw_receive(state.1, &mut request).await?,
+            Err(refused) => refused,
+        };
         let connection = request.body_connection.finalize().await?;
         reply.write_to(connection, response_writer).await
     }
@@ -1285,6 +1476,7 @@ pub async fn web_task(task_id: usize, stack: Stack<'static>, timer: &'static Tim
         .route("/oft/v1/config/save", get(get_config_save).post(post_config_save).delete(delete_config_save))
         .route("/oft/v1/network", get(get_network).put(put_network))
         .route("/oft/v1/pins", get(get_pins).put(put_pins))
+        .route("/oft/v1/control", get(get_control).post(post_control))
         .route("/oft/v1/restart", post(post_restart))
         .route("/oft/v1/crossings", get(crossings))
         .route("/oft/v1/samples", get(samples))
@@ -1341,6 +1533,9 @@ pub async fn status_tick_task(timer: &'static Timer) {
         embassy_time::Timer::after_secs(1).await;
         if BOOTSEL_REQUESTED.load(core::sync::atomic::Ordering::Relaxed) {
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+        }
+        if timer.with(|i| i.control.expire(crate::state::now_us())) {
+            publisher.publish_immediate(Event::Control);
         }
         publisher.publish_immediate(Event::Status);
     }

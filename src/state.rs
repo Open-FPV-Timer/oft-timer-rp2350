@@ -237,7 +237,14 @@ pub struct Inner {
     pub net_now: Option<NetNow>,
     /// The Node pins this boot started with.
     pub pins_boot: crate::board::Pins,
+    /// Who may write (spec §6.6).
+    pub control: oft_core::control::Control<MAX_CLAIMS>,
+    /// `config_rev` in `/status`: moves whenever the config or what is saved changes.
+    pub config_rev: u32,
 }
+
+/// Standing control claims: one per stream, and `events` takes four subscribers.
+pub const MAX_CLAIMS: usize = 4;
 
 pub struct Timer {
     /// Shared by the executor's tasks only, never by interrupt handlers, so the lock must not
@@ -257,6 +264,8 @@ pub enum Event {
     /// A full-rate batch from the Node, already on the Timer clock.
     Samples { seat: u8, t0: u64, dt_us: u16, n: u8, p: [i16; 32], nf: i16 },
     Status,
+    /// A claim or the holder of control changed.
+    Control,
 }
 
 impl Timer {
@@ -287,6 +296,8 @@ impl Timer {
                 net_recovery,
                 net_now: None,
                 pins_boot: saved.pins,
+                control: oft_core::control::Control::new(boot_id),
+                config_rev: 0,
             })),
             events: PubSubChannel::new(),
             boot_id,
@@ -314,6 +325,7 @@ impl Timer {
                 i.plan_dirty = true;
             }
             i.config = config;
+            i.config_rev = i.config_rev.wrapping_add(1);
         });
     }
 

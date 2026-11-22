@@ -30,6 +30,9 @@ pub async fn save(timer: &Timer, fw: &Fw, saved: Saved) -> Result<(), &'static s
     let mut buf = [0u8; JSON_MAX];
     let n = serde_json_core::to_slice(&SavedJson::from(&saved), &mut buf).map_err(|_| "settings too large to save")?;
     fw.store.lock().await.write_settings(&buf[..n])?;
-    timer.with(|i| i.saved = saved);
+    timer.with(|i| {
+        i.saved = saved;
+        i.config_rev = i.config_rev.wrapping_add(1);
+    });
     Ok(())
 }
