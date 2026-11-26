@@ -1,37 +1,92 @@
-//! The Node link over UART1: decode frames into the host, send plans and pings, and pulse
-//! SYNC. Also drives the C5's EN/BOOT lines for reset and (later) flashing.
+//! The Node links: decode each Node's frames into the hosts, send plans and pings, and pulse
+//! SYNC. Also drives the Nodes' EN/BOOT lines for reset and flashing.
+//!
+//! Each Node has its own serial link and its own pair of tasks. SYNC, EN and BOOT are one
+//! wire each, shared by every Node: a reset restarts them all.
 
-use crate::state::{Event, NodeFlash, Timer, Trace, WireTest};
-use embassy_sync::pipe::Pipe;
-use oft_fwimage::esprom;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
-use portable_atomic::{AtomicU32, AtomicU8, Ordering};
+use crate::board::MAX_NODES;
+use crate::state::{Event, NodeFlash, NodeWireTest, Timer, Trace, WireTest};
 use embassy_rp::gpio::Output;
-use embassy_rp::uart::BufferedUartRx;
-use embassy_rp::uart::BufferedUartTx;
+use embassy_rp::peripherals::PIO0;
+use embassy_rp::pio_programs::uart::PioUartTx;
+use embassy_rp::uart::{BufferedUartRx, BufferedUartTx};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::pipe::Pipe;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer as Delay};
 use embedded_io_async::{Read, Write};
 use oft_core::Event as HostEvent;
+use oft_fwimage::esprom;
 use oft_nodelink::msg::Message;
 use oft_nodelink::{encode_frame, FrameDecoder, MAX_FRAME};
+use portable_atomic::{AtomicU32, AtomicU8, Ordering};
 
-/// Who the UART is talking to.
+/// The receiving half of a Node link.
+pub enum LinkRx {
+    /// A hardware UART (Nodes 1 and 2).
+    Uart(BufferedUartRx),
+    /// A PIO state machine filling a ring by DMA (Nodes 3 and 4).
+    Ring(crate::piolink::RingRx),
+}
+
+impl LinkRx {
+    /// Wait for bytes. `Err` is a receive error the UART reported; reading goes on.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+        match self {
+            LinkRx::Uart(rx) => rx.read(buf).await.map_err(|_| ()),
+            LinkRx::Ring(rx) => Ok(rx.read(buf).await),
+        }
+    }
+}
+
+/// The sending half of a Node link.
+pub enum LinkTx {
+    Uart(BufferedUartTx),
+    Pio0(PioUartTx<'static, PIO0, 0>),
+    Pio2(PioUartTx<'static, PIO0, 2>),
+}
+
+impl LinkTx {
+    async fn write_all(&mut self, buf: &[u8]) {
+        match self {
+            LinkTx::Uart(tx) => {
+                let _ = tx.write_all(buf).await;
+            }
+            LinkTx::Pio0(tx) => {
+                let _ = tx.write_all(buf).await;
+            }
+            LinkTx::Pio2(tx) => {
+                let _ = tx.write_all(buf).await;
+            }
+        }
+    }
+}
+
+/// Who each link is talking to.
 /// `LINK`: the Node firmware, over the Node link.
 /// `ROM_PROBE` (wiring test): the TX task sends ROM sync packets in place of pings, and the
 /// RX task counts the ROM's answers.
 /// `ROM_LOADER` (flashing): the RX task passes every byte to `ROM_RX`, and the TX task sends
-/// what arrives in `ROM_TX`.
-static ROM_MODE: AtomicU8 = AtomicU8::new(LINK);
+/// what arrives in `ROM_TX`. One link at a time.
+/// `QUIET`: nothing is sent and what arrives is thrown away (a Node sitting in its
+/// bootloader while another is written).
+static ROM_MODE: [AtomicU8; MAX_NODES] = [const { AtomicU8::new(LINK) }; MAX_NODES];
 const LINK: u8 = 0;
 const ROM_PROBE: u8 = 1;
 const ROM_LOADER: u8 = 2;
+const QUIET: u8 = 3;
 /// Bytes from the ROM bootloader to the flasher, and requests from the flasher to the wire.
 static ROM_RX: Pipe<CriticalSectionRawMutex, 512> = Pipe::new();
 static ROM_TX: Pipe<CriticalSectionRawMutex, { esprom::MAX_FRAME }> = Pipe::new();
 
+fn set_modes(mode: u8) {
+    for m in &ROM_MODE {
+        m.store(mode, Ordering::Relaxed);
+    }
+}
+
 /// A Node firmware file sitting in the Timer's scratch area (`fw::node_store`), to be
-/// written to the Node's flash.
+/// written to a Node's flash.
 #[derive(Clone, Copy)]
 pub struct NodeJob {
     /// Offset in the Node's flash.
@@ -40,15 +95,17 @@ pub struct NodeJob {
     pub md5: [u8; 16],
     /// Baud rate to talk to the ROM bootloader at (it measures the rate from the sync).
     pub baud: u32,
+    /// The Node to write, from 0; `None` = every wired Node, one after the other.
+    pub node: Option<u8>,
 }
 /// Raised by `POST /oft/v1/fw/node` once the file is stored.
 pub static NODE_FLASH: Signal<CriticalSectionRawMutex, NodeJob> = Signal::new();
 /// Size the Node's flash is described as to its bootloader. Every part written lies below it.
 const NODE_FLASH_BYTES: u32 = 4 * 1024 * 1024;
-/// ROM sync answers seen.
-static ROM_SYNC_SEEN: AtomicU32 = AtomicU32::new(0);
-/// Times the Node was seen to restart: a new Hello, or its clock running backwards.
-static NODE_REBOOTS: AtomicU32 = AtomicU32::new(0);
+/// ROM sync answers seen, per Node.
+static ROM_SYNC_SEEN: [AtomicU32; MAX_NODES] = [const { AtomicU32::new(0) }; MAX_NODES];
+/// Times each Node was seen to restart: a new Hello, or its clock running backwards.
+static NODE_REBOOTS: [AtomicU32; MAX_NODES] = [const { AtomicU32::new(0) }; MAX_NODES];
 /// Raised by `POST /oft/v1/node/wiretest`.
 pub static WIRE_TEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -76,10 +133,10 @@ const ROM_SYNC: [u8; 46] = {
 /// Baud rate the ROM loader is addressed at (its conventional rate; it autobauds on SYNC).
 const ROM_BAUD: u32 = 115_200;
 
-/// Change UART1's baud rate after the driver has been split into halves (the driver only
-/// offers this on the unsplit port). Same arithmetic as embassy-rp's `set_baudrate`.
-fn set_node_baud(baud: u32) {
-    let r = embassy_rp::pac::UART1;
+/// Change a hardware UART's baud rate after the driver has been split into halves (the
+/// driver only offers this on the unsplit port). Same arithmetic as embassy-rp's
+/// `set_baudrate`.
+fn set_uart_baud(r: embassy_rp::pac::uart::Uart, baud: u32) {
     let div = (8 * embassy_rp::clocks::clk_peri_freq()) / baud;
     let (mut ibrd, mut fbrd) = (div >> 7, ((div & 0x7f) + 1) / 2);
     if ibrd == 0 {
@@ -95,51 +152,63 @@ fn set_node_baud(baud: u32) {
     r.uartlcr_h().modify(|_| {});
 }
 
-async fn send(tx: &mut BufferedUartTx, m: &Message) {
-    let mut buf = [0u8; MAX_FRAME];
-    if let Ok(n) = encode_frame(m, &mut buf) {
-        let _ = tx.write_all(&buf[..n]).await;
+/// Change the baud rate of Node `n`'s link.
+fn set_baud(n: usize, baud: u32) {
+    match n {
+        0 => set_uart_baud(embassy_rp::pac::UART1, baud),
+        1 => set_uart_baud(embassy_rp::pac::UART0, baud),
+        _ => crate::piolink::set_baud(n, baud),
     }
 }
 
-/// Read the Node's bytes forever.
-#[embassy_executor::task]
-pub async fn node_rx_task(timer: &'static Timer, mut rx: BufferedUartRx) {
+async fn send(tx: &mut LinkTx, m: &Message) {
+    let mut buf = [0u8; MAX_FRAME];
+    if let Ok(n) = encode_frame(m, &mut buf) {
+        tx.write_all(&buf[..n]).await;
+    }
+}
+
+/// Read Node `n`'s bytes forever.
+#[embassy_executor::task(pool_size = MAX_NODES)]
+pub async fn node_rx_task(timer: &'static Timer, n: usize, mut rx: LinkRx) {
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 256];
     let publisher = timer.events.publisher().unwrap();
     let mut rom_match = 0u8;
     let mut last_pong_t_node = 0u64;
     loop {
-        let n = match rx.read(&mut buf).await {
+        let len = match rx.read(&mut buf).await {
             Ok(0) => {
                 Delay::after_millis(5).await;
                 continue;
             }
-            Err(_) => {
+            Err(()) => {
                 // Overrun, framing, noise or break on the wire. Count it and keep reading:
                 // the frame decoder resynchronises at the next frame boundary.
-                timer.with(|i| i.uart_errors = i.uart_errors.wrapping_add(1));
+                timer.with(|i| i.nodes[n].uart_errors = i.nodes[n].uart_errors.wrapping_add(1));
                 continue;
             }
-            Ok(n) => n,
+            Ok(len) => len,
         };
         let t = crate::state::now_us();
-        let mode = ROM_MODE.load(Ordering::Relaxed);
+        let mode = ROM_MODE[n].load(Ordering::Relaxed);
+        if mode == QUIET {
+            continue;
+        }
         if mode == ROM_LOADER {
             // The flasher reads these. Its replies are tens of bytes; if the pipe is ever
             // full the rest is dropped and that request times out and is retried.
-            let _ = ROM_RX.try_write(&buf[..n]);
+            let _ = ROM_RX.try_write(&buf[..len]);
             continue;
         }
         if mode == ROM_PROBE {
             // Talking to the ROM loader at another baud rate: these are not Node-link frames.
-            for &b in &buf[..n] {
+            for &b in &buf[..len] {
                 rom_match = match (rom_match, b) {
                     (0, 0xC0) => 1,
                     (1, 0x01) => 2,
                     (2, 0x08) => {
-                        ROM_SYNC_SEEN.fetch_add(1, Ordering::Relaxed);
+                        ROM_SYNC_SEEN[n].fetch_add(1, Ordering::Relaxed);
                         0
                     }
                     (_, 0xC0) => 1,
@@ -148,25 +217,26 @@ pub async fn node_rx_task(timer: &'static Timer, mut rx: BufferedUartRx) {
             }
             continue;
         }
-        for &b in &buf[..n] {
+        for &b in &buf[..len] {
             let msg = match dec.push(b) {
                 Some(Ok(m)) => m,
                 Some(Err(_)) => {
-                    timer.with(|i| i.dropped_frames = i.dropped_frames.wrapping_add(1));
+                    timer.with(|i| i.nodes[n].dropped_frames = i.nodes[n].dropped_frames.wrapping_add(1));
                     continue;
                 }
                 None => continue,
             };
+            let mut restarted = false;
             match &msg {
                 Message::Hello(_) => {
-                    NODE_REBOOTS.fetch_add(1, Ordering::Relaxed);
+                    NODE_REBOOTS[n].fetch_add(1, Ordering::Relaxed);
                 }
                 Message::Pong(p) => {
                     if p.t_node < last_pong_t_node {
-                        NODE_REBOOTS.fetch_add(1, Ordering::Relaxed);
+                        NODE_REBOOTS[n].fetch_add(1, Ordering::Relaxed);
                         // The Node restarted and its Hello did not arrive (or has not yet):
                         // it has no plan, so send ours again.
-                        timer.with(|i| i.plan_dirty = true);
+                        restarted = true;
                     }
                     last_pong_t_node = p.t_node;
                 }
@@ -175,41 +245,44 @@ pub async fn node_rx_task(timer: &'static Timer, mut rx: BufferedUartRx) {
             // Everything below is short and non-blocking; events are queued for the WS tasks.
             let mut out: heapless::Vec<Event, 8> = heapless::Vec::new();
             timer.with(|i| {
-                i.last_node_rx_us = Some(t);
-                if !i.node_connected {
-                    // Back after a silence (a restart, a flash, a cable): it may have no plan.
-                    i.plan_dirty = true;
+                i.node_heard(n, t);
+                if restarted {
+                    i.nodes[n].plan_dirty = true;
                 }
-                i.node_connected = true;
                 if let Message::Samples(s) = &msg {
-                    let clock = *i.host.clock();
-                    let t0 = clock.to_timer(s.t0);
-                    if let Some(slot) = i.traces.get_mut(s.seat as usize) {
-                        let tr = slot.get_or_insert_with(Trace::new);
-                        if s.dt_us > 0 {
-                            tr.rate_hz = 1_000_000 / s.dt_us as u32;
+                    // Only from the Node the seat is on (as `Hosts::feed` does for detection).
+                    if i.hosts.seat_node(s.seat) == Some(n as u8) {
+                        let clock = *i.hosts.clock(n);
+                        let t0 = clock.to_timer(s.t0);
+                        if let Some(slot) = i.traces.get_mut(s.seat as usize) {
+                            let tr = slot.get_or_insert_with(Trace::new);
+                            if s.dt_us > 0 {
+                                tr.rate_hz = 1_000_000 / s.dt_us as u32;
+                            }
+                            for (k, &p) in s.power().iter().enumerate() {
+                                tr.push(t0 + k as u64 * s.dt_us as u64, p);
+                            }
                         }
-                        for (k, &p) in s.power().iter().enumerate() {
-                            tr.push(t0 + k as u64 * s.dt_us as u64, p);
+                        // Fan out in 32-sample pieces so one event stays small.
+                        for (k, chunk) in s.power().chunks(32).enumerate() {
+                            let mut p = [0i16; 32];
+                            p[..chunk.len()].copy_from_slice(chunk);
+                            let _ = out.push(Event::Samples {
+                                seat: s.seat,
+                                t0: t0 + (k * 32) as u64 * s.dt_us as u64,
+                                dt_us: s.dt_us,
+                                n: chunk.len() as u8,
+                                p,
+                                nf: s.noise_floor,
+                            });
                         }
-                    }
-                    // Fan out in 32-sample pieces so one event stays small.
-                    for (k, chunk) in s.power().chunks(32).enumerate() {
-                        let mut p = [0i16; 32];
-                        p[..chunk.len()].copy_from_slice(chunk);
-                        let _ = out.push(Event::Samples {
-                            seat: s.seat,
-                            t0: t0 + (k * 32) as u64 * s.dt_us as u64,
-                            dt_us: s.dt_us,
-                            n: chunk.len() as u8,
-                            p,
-                            nf: s.noise_floor,
-                        });
                     }
                 }
-                let crate::state::Inner { host, crossings, next_seq, node_temp_dc, node_status, plan_dirty, .. } = i;
-                host.feed(&msg, t, |e| match e {
-                    HostEvent::Hello(_) => *plan_dirty = true,
+                let before = i.seat_nodes();
+                let crate::state::Inner { hosts, crossings, next_seq, nodes, .. } = i;
+                let changed = hosts.feed(n, &msg, t, |e| match e {
+                    // `feed` says whose plan to send.
+                    HostEvent::Hello(_) => {}
                     HostEvent::Crossing(c) => {
                         let seq = *next_seq;
                         *next_seq += 1;
@@ -221,11 +294,12 @@ pub async fn node_rx_task(timer: &'static Timer, mut rx: BufferedUartRx) {
                     }
                     HostEvent::Status(s) => {
                         // i16::MIN = the Node has no reading; 0 = Node firmware before it had a sensor.
-                                *node_temp_dc = (s.temp_dc != i16::MIN && s.temp_dc != 0).then_some(s.temp_dc);
-                        *node_status = Some(s);
+                        nodes[n].temp_dc = (s.temp_dc != i16::MIN && s.temp_dc != 0).then_some(s.temp_dc);
+                        nodes[n].status = Some(s);
                     }
                     HostEvent::Synced => {}
                 });
+                i.rescheduled(before, changed);
             });
             for e in out {
                 publisher.publish_immediate(e);
@@ -234,31 +308,36 @@ pub async fn node_rx_task(timer: &'static Timer, mut rx: BufferedUartRx) {
     }
 }
 
-/// Send plans when dirty, ping once a second, and watch the link for silence.
-#[embassy_executor::task]
-pub async fn node_tx_task(timer: &'static Timer, mut tx: BufferedUartTx) {
+/// For Node `n`: send its plan when it changes, ping once a second, and watch the link for
+/// silence.
+#[embassy_executor::task(pool_size = MAX_NODES)]
+pub async fn node_tx_task(timer: &'static Timer, n: usize, mut tx: LinkTx) {
     let mut next_ping = Instant::now();
     loop {
-        match ROM_MODE.load(Ordering::Relaxed) {
+        match ROM_MODE[n].load(Ordering::Relaxed) {
             ROM_PROBE => {
-                let _ = tx.write_all(&ROM_SYNC).await;
+                tx.write_all(&ROM_SYNC).await;
                 Delay::after_millis(100).await;
                 continue;
             }
             ROM_LOADER => {
                 // Send whatever the flasher queued; look at the mode again at least every 20 ms.
                 let mut chunk = [0u8; 256];
-                if let Ok(n) = embassy_time::with_timeout(Duration::from_millis(20), ROM_TX.read(&mut chunk)).await {
-                    let _ = tx.write_all(&chunk[..n]).await;
+                if let Ok(len) = embassy_time::with_timeout(Duration::from_millis(20), ROM_TX.read(&mut chunk)).await {
+                    tx.write_all(&chunk[..len]).await;
                 }
+                continue;
+            }
+            QUIET => {
+                Delay::after_millis(20).await;
                 continue;
             }
             _ => {}
         }
         let plan = timer.with(|i| {
-            if i.plan_dirty {
-                i.plan_dirty = false;
-                Some(i.config.plan())
+            if i.nodes[n].plan_dirty {
+                i.nodes[n].plan_dirty = false;
+                Some(i.hosts.plan(n))
             } else {
                 None
             }
@@ -268,15 +347,13 @@ pub async fn node_tx_task(timer: &'static Timer, mut tx: BufferedUartTx) {
         }
         if Instant::now() >= next_ping {
             let t = crate::state::now_us();
-            let ping = timer.with(|i| i.host.make_ping(t));
+            let ping = timer.with(|i| i.hosts.make_ping(n, t));
             send(&mut tx, &ping).await;
             next_ping = Instant::now() + Duration::from_secs(1);
-            // Node silence check.
+            // Node silence check: after 3 s the other Nodes take its seats.
             timer.with(|i| {
-                if let Some(last) = i.last_node_rx_us {
-                    if t.saturating_sub(last) > 3_000_000 {
-                        i.node_connected = false;
-                    }
+                if i.nodes[n].last_rx_us.is_some_and(|last| t.saturating_sub(last) > 3_000_000) {
+                    i.node_lost(n);
                 }
             });
         }
@@ -284,7 +361,7 @@ pub async fn node_tx_task(timer: &'static Timer, mut tx: BufferedUartTx) {
     }
 }
 
-/// Pulse SYNC at 20 Hz. The pulse time is recorded in the host *before* the edge so the
+/// Pulse SYNC at 20 Hz. The pulse time is recorded in the hosts *before* the edge so each
 /// Node's report always finds its pulse.
 #[embassy_executor::task]
 pub async fn sync_task(timer: &'static Timer, mut sync: Output<'static>) {
@@ -293,18 +370,16 @@ pub async fn sync_task(timer: &'static Timer, mut sync: Output<'static>) {
         next += Duration::from_millis(50);
         Delay::at(next).await;
         let t = crate::state::now_us();
-        timer.with(|i| {
-            i.host.sync_pulsed(t);
-        });
+        timer.with(|i| i.hosts.sync_pulsed(t));
         sync.set_high();
         Delay::after_micros(200).await;
         sync.set_low();
     }
 }
 
-/// Hold the C5 in reset, then release it (normal boot). Used at power-up so the Node and
-/// Timer start together, and before flashing.
-pub async fn reset_node(en: &mut Output<'static>, boot: &mut Output<'static>, download_mode: bool) {
+/// Hold the C5s in reset, then release them (normal boot). Used at power-up so the Nodes
+/// and Timer start together, and before flashing. Every Node is on these two wires.
+pub async fn reset_nodes(en: &mut Output<'static>, boot: &mut Output<'static>, download_mode: bool) {
     if download_mode {
         boot.set_low();
     } else {
@@ -317,16 +392,27 @@ pub async fn reset_node(en: &mut Output<'static>, boot: &mut Output<'static>, do
     boot.set_high();
 }
 
-/// Wait for evidence that the Node restarted after `base` was read. Returns the wait in ms.
-async fn wait_reboot(base: u32, limit: Duration) -> Option<u32> {
+/// How often each Node has restarted so far.
+fn reboots() -> [u32; MAX_NODES] {
+    core::array::from_fn(|n| NODE_REBOOTS[n].load(Ordering::Relaxed))
+}
+
+/// Wait for evidence that each of the first `count` Nodes restarted after `base` was read.
+/// Returns each one's wait in ms, `None` for those not back within `limit`.
+async fn wait_reboots(count: usize, base: [u32; MAX_NODES], limit: Duration) -> [Option<u32>; MAX_NODES] {
     let t0 = Instant::now();
-    while t0.elapsed() < limit {
-        if NODE_REBOOTS.load(Ordering::Relaxed) != base {
-            return Some(t0.elapsed().as_millis() as u32);
+    let mut back = [None; MAX_NODES];
+    loop {
+        for n in 0..count {
+            if back[n].is_none() && NODE_REBOOTS[n].load(Ordering::Relaxed) != base[n] {
+                back[n] = Some(t0.elapsed().as_millis() as u32);
+            }
+        }
+        if back[..count].iter().all(|b| b.is_some()) || t0.elapsed() >= limit {
+            return back;
         }
         Delay::after_millis(100).await;
     }
-    None
 }
 
 /// What happened around a failed Node firmware write, for `GET /oft/v1/fw/node`: when, which
@@ -402,7 +488,7 @@ async fn rom_cmd(req: &esprom::Request, timeout: Duration, frame: &mut [u8; espr
 
 /// Write the stored file to the Node through its ROM bootloader and check it. The Node is
 /// in download mode when this returns, whatever the outcome; the caller restarts it.
-async fn rom_flash(timer: &'static Timer, job: &NodeJob, en: &mut Output<'static>, boot: &mut Output<'static>) -> Result<(), &'static str> {
+async fn rom_flash(timer: &'static Timer, job: &NodeJob, n: usize, en: &mut Output<'static>, boot: &mut Output<'static>) -> Result<(), &'static str> {
     use md5::Digest as _;
     static FRAME: static_cell::StaticCell<[u8; esprom::MAX_FRAME]> = static_cell::StaticCell::new();
     static FRAME_REF: Signal<CriticalSectionRawMutex, &'static mut [u8; esprom::MAX_FRAME]> = Signal::new();
@@ -421,10 +507,13 @@ async fn rom_flash(timer: &'static Timer, job: &NodeJob, en: &mut Output<'static
         }
 
         step("restarting the Node into its bootloader");
-        ROM_MODE.store(ROM_LOADER, Ordering::Relaxed);
+        // EN and BOOT reach every Node, so they all restart into their bootloaders. Only
+        // this one is spoken to; the others are left alone until the restart at the end.
+        set_modes(QUIET);
+        ROM_MODE[n].store(ROM_LOADER, Ordering::Relaxed);
         Delay::after_millis(150).await;
-        set_node_baud(job.baud);
-        reset_node(en, boot, true).await;
+        set_baud(n, job.baud);
+        reset_nodes(en, boot, true).await;
         let t0 = Instant::now();
         loop {
             if rom_cmd(&esprom::sync(), Duration::from_millis(150), frame).await.is_ok() {
@@ -538,18 +627,20 @@ async fn rom_flash(timer: &'static Timer, job: &NodeJob, en: &mut Output<'static
     result
 }
 
-/// Owns the C5's EN and BOOT lines after start-up and runs the wiring test on request:
+/// Owns the Nodes' EN and BOOT lines after start-up. Writes Node firmware on request, and
+/// runs the wiring test:
 ///
-/// 1. **EN**: pulse reset and wait for the Node to come back (a new Hello, or its clock
+/// 1. **EN**: pulse reset and wait for each Node to come back (a new Hello, or its clock
 ///    starting again from zero).
-/// 2. **BOOT**: hold BOOT low through a reset, which should start the C5's ROM bootloader on
-///    the same serial pins, and send it SYNC packets until it answers.
-/// 3. Reset normally again and wait for the Node to return.
+/// 2. **BOOT**: hold BOOT low through a reset, which should start each C5's ROM bootloader
+///    on the same serial pins, and send it SYNC packets until it answers.
+/// 3. Reset normally again and wait for the Nodes to return.
 ///
-/// Timing stops for the duration (up to a few minutes if the Node is slow to start).
+/// Timing stops for the duration (up to a few minutes if a Node is slow to start).
 #[embassy_executor::task]
 pub async fn node_ctl_task(timer: &'static Timer, mut en: Output<'static>, mut boot: Output<'static>) {
     const RETURN_LIMIT: Duration = Duration::from_secs(90);
+    let count = timer.with(|i| i.node_count());
     loop {
         let job = match embassy_futures::select::select(WIRE_TEST.wait(), NODE_FLASH.wait()).await {
             embassy_futures::select::Either::First(()) => None,
@@ -558,16 +649,35 @@ pub async fn node_ctl_task(timer: &'static Timer, mut en: Output<'static>, mut b
         if let Some(job) = job {
             let t0 = Instant::now();
             FLASH_DIAG.lock(|d| d.borrow_mut().clear());
-            let result = rom_flash(timer, &job, &mut en, &mut boot).await;
-            // Whatever happened, go back to the Node link and start the Node normally: after
-            // a failed write the old firmware is gone, and the Node then simply stays silent.
-            timer.with(|i| i.node_flash.step = "restarting the Node");
-            Delay::after_millis(150).await;
-            set_node_baud(crate::board::node::BAUD);
-            let base = NODE_REBOOTS.load(Ordering::Relaxed);
-            reset_node(&mut en, &mut boot, false).await;
-            ROM_MODE.store(LINK, Ordering::Relaxed);
-            let back = wait_reboot(base, if result.is_ok() { RETURN_LIMIT } else { Duration::from_secs(10) }).await;
+            let (first, last) = match job.node {
+                Some(n) => (n as usize, n as usize + 1),
+                None => (0, count),
+            };
+            timer.with(|i| i.node_flash.nodes = (last - first) as u8);
+            let mut result = Ok(());
+            for n in first..last {
+                timer.with(|i| {
+                    i.node_flash.node = n as u8;
+                    i.node_flash.written = 0;
+                });
+                if last - first > 1 {
+                    diag(format_args!("[Node {}] ", n + 1));
+                }
+                result = rom_flash(timer, &job, n, &mut en, &mut boot).await;
+                Delay::after_millis(150).await;
+                set_baud(n, crate::board::node::BAUD);
+                if result.is_err() {
+                    break;
+                }
+                timer.with(|i| i.node_flash.nodes_done += 1);
+            }
+            // Whatever happened, go back to the Node link and start the Nodes normally: after
+            // a failed write the old firmware is gone, and that Node then simply stays silent.
+            timer.with(|i| i.node_flash.step = "restarting the Nodes");
+            let base = reboots();
+            reset_nodes(&mut en, &mut boot, false).await;
+            set_modes(LINK);
+            let back = wait_reboots(count, base, if result.is_ok() { RETURN_LIMIT } else { Duration::from_secs(10) }).await;
             timer.with(|i| {
                 i.node_flash = NodeFlash {
                     running: false,
@@ -575,50 +685,61 @@ pub async fn node_ctl_task(timer: &'static Timer, mut en: Output<'static>, mut b
                     ok: result.is_ok(),
                     step: "finished",
                     error: result.err().unwrap_or(""),
-                    returned: Some(back.is_some()),
+                    returned: Some(back[first..last].iter().all(|b| b.is_some())),
                     seconds: t0.elapsed().as_secs() as u32,
                     ..i.node_flash
                 };
             });
             continue;
         }
-        timer.with(|i| i.wire_test = WireTest { running: true, step: "EN: resetting the Node and waiting for it to return", ..WireTest::default() });
+        timer.with(|i| i.wire_test = WireTest { running: true, step: "EN: resetting the Nodes and waiting for them to return", ..WireTest::default() });
 
-        let base = NODE_REBOOTS.load(Ordering::Relaxed);
-        reset_node(&mut en, &mut boot, false).await;
-        let back = wait_reboot(base, RETURN_LIMIT).await;
+        let base = reboots();
+        reset_nodes(&mut en, &mut boot, false).await;
+        let back = wait_reboots(count, base, RETURN_LIMIT).await;
         timer.with(|i| {
-            i.wire_test.en_ok = Some(back.is_some());
-            i.wire_test.en_ms = back.unwrap_or(0);
+            for n in 0..count {
+                i.wire_test.nodes[n] = NodeWireTest { en_ok: Some(back[n].is_some()), en_ms: back[n].unwrap_or(0), ..NodeWireTest::default() };
+            }
             i.wire_test.step = "BOOT: resetting with BOOT held low and calling the ROM bootloader";
         });
 
         // Stop Node-link traffic, let the last frame drain, then move to the ROM's baud rate.
-        ROM_SYNC_SEEN.store(0, Ordering::Relaxed);
-        ROM_MODE.store(ROM_PROBE, Ordering::Relaxed);
+        for seen in &ROM_SYNC_SEEN {
+            seen.store(0, Ordering::Relaxed);
+        }
+        set_modes(ROM_PROBE);
         Delay::after_millis(150).await;
-        set_node_baud(ROM_BAUD);
-        reset_node(&mut en, &mut boot, true).await;
+        for n in 0..count {
+            set_baud(n, ROM_BAUD);
+        }
+        reset_nodes(&mut en, &mut boot, true).await;
         let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(5) && ROM_SYNC_SEEN.load(Ordering::Relaxed) == 0 {
+        let answered = |n: usize| ROM_SYNC_SEEN[n].load(Ordering::Relaxed) > 0;
+        while t0.elapsed() < Duration::from_secs(5) && !(0..count).all(answered) {
             Delay::after_millis(100).await;
         }
-        let boot_ok = ROM_SYNC_SEEN.load(Ordering::Relaxed) > 0;
         timer.with(|i| {
-            i.wire_test.boot_ok = Some(boot_ok);
-            i.wire_test.step = "restarting the Node normally";
+            for n in 0..count {
+                i.wire_test.nodes[n].boot_ok = Some(answered(n));
+            }
+            i.wire_test.step = "restarting the Nodes normally";
         });
 
         // Back to the Node link. Reset while still quiet, then resume pings.
         Delay::after_millis(150).await;
-        set_node_baud(crate::board::node::BAUD);
-        let base = NODE_REBOOTS.load(Ordering::Relaxed);
-        reset_node(&mut en, &mut boot, false).await;
-        ROM_MODE.store(LINK, Ordering::Relaxed);
-        let back = wait_reboot(base, RETURN_LIMIT).await;
+        for n in 0..count {
+            set_baud(n, crate::board::node::BAUD);
+        }
+        let base = reboots();
+        reset_nodes(&mut en, &mut boot, false).await;
+        set_modes(LINK);
+        let back = wait_reboots(count, base, RETURN_LIMIT).await;
         timer.with(|i| {
-            i.wire_test.recovered = Some(back.is_some());
-            i.wire_test.recover_ms = back.unwrap_or(0);
+            for n in 0..count {
+                i.wire_test.nodes[n].recovered = Some(back[n].is_some());
+                i.wire_test.nodes[n].recover_ms = back[n].unwrap_or(0);
+            }
             i.wire_test.step = "finished";
             i.wire_test.running = false;
             i.wire_test.done = true;

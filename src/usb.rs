@@ -202,13 +202,16 @@ async fn run(port: &mut Port, timer: &'static Timer, fw: &'static Fw, line: &str
             say(port, &s).await?;
             s.clear();
             timer.with(|i| {
-                let clock = i.host.clock();
-                let _ = write!(s, "Node {}, clock {}", if i.node_connected { "connected" } else { "NOT connected" }, if clock.is_synced() { "synced" } else { "not synced" });
-                let _ = write!(s, ", lost samples {}, receive errors {}", i.host.dropped_samples, i.dropped_frames);
+                let count = i.node_count();
+                let up = (0..count).filter(|&n| i.nodes[n].connected).count();
+                let synced = (0..count).filter(|&n| i.nodes[n].connected && i.hosts.clock(n).is_synced()).count();
+                let _ = write!(s, "Nodes {} of {} connected, {} with a synced clock", up, count, synced);
+                let errors = i.nodes.iter().fold(0u32, |a, n| a.wrapping_add(n.dropped_frames));
+                let _ = write!(s, ", lost samples {}, receive errors {}", i.hosts.dropped_samples(), errors);
                 if let Some(t) = i.timer_temp_dc {
                     let _ = write!(s, ", Timer {} C", t / 10);
                 }
-                if let Some(t) = i.node_temp_dc {
+                if let Some(t) = i.nodes.iter().filter_map(|n| n.temp_dc).max() {
                     let _ = write!(s, ", Node {} C", t / 10);
                 }
                 let _ = s.push_str("\r\n");

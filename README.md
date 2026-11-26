@@ -1,7 +1,7 @@
 # oft-timer-rp2350 — OFT Timer firmware (build B1)
 
 Firmware for the **Waveshare RP2350-POE-ETH** (RP2350A, W6300 Ethernet, PoE module) driving one
-**XIAO ESP32-C5** Node over UART. It serves the OFT Protocol (spec §6) on port 7270 and runs the
+to four **XIAO ESP32-C5** Nodes, each on its own serial link. It serves the OFT Protocol (spec §6) on port 7270 and runs the
 shared `oft-core` detection and clock mapping. Rust, Embassy, stable toolchain.
 
 Status (2026-11-08): **compiles for the target; not yet run on hardware.** The boards are on
@@ -126,12 +126,35 @@ OFT_FW_IMAGE=../oft-timer.bin cargo test --target x86_64-unknown-linux-gnu   # a
 | Node EN (reset) | GP7 → | EN / RST |
 | Node BOOT | GP8 → | BOOT strap |
 
-These are the default pins. The five Node pins are a saved setting: the **Advanced** page
-(or `PUT /oft/v1/pins`) moves them, applied at the next restart, so a board wired
-differently runs the same firmware. UART1 can transmit on GP4, GP6, GP8, GP10, GP22 or
-GP26 and receive on GP5, GP7, GP11 or GP27; SYNC, EN and BOOT take any header GPIO but GP9
-(the recovery jumper). Wrong pins cannot lock you out: the page stays reachable and the
-Node stays silent until they match the wiring.
+These are the default pins, for one Node. The wiring is a saved setting: the **Advanced**
+page (or `PUT /oft/v1/pins`) moves it, applied at the next restart, so a board wired
+differently runs the same firmware. SYNC, EN and BOOT take any header GPIO but GP9 (the
+recovery jumper). Wrong pins cannot lock you out: the page stays reachable and a Node
+stays silent until they match the wiring.
+
+### More than one Node
+
+Set **Nodes** on the Advanced page to how many are wired (up to four) and give each its
+data pins. Every Node has its own TX/RX pair. SYNC, EN and BOOT are one wire each, joined
+to every Node (so a reset restarts them all).
+
+| Node | Link | Timer TX (to the Node's D7) | Timer RX (from the Node's D6) |
+|---|---|---|---|
+| 1 | UART1 | GP4, GP6, GP8, GP10, GP22 or GP26 | GP5, GP7, GP11 or GP27 |
+| 2 | UART0 | GP0, GP2, GP12, GP14 or GP28 | GP1, GP3, GP13 or GP15 |
+| 3, 4 | PIO (a UART in software) | any free header GPIO | any free header GPIO |
+
+- **Seats are shared out automatically** (spec §4.1, `oft-core`'s `sched`). With as many
+  Nodes as seats, each Node watches one seat and never hops. With more seats than Nodes,
+  neighbouring channels go to the same Node. `/status` says which Node has each seat.
+- **A Node that goes quiet for 3 s loses its seats** to the others, and takes seats back
+  when it returns. Seats that do not move are not disturbed.
+- **Node firmware** goes to every wired Node, one after the other, from one upload
+  (`?node=0` writes only the first, and so on). All Nodes restart together.
+- **The wiring test** reports each Node separately.
+- **Not yet run on hardware:** all of the above. The two-Node path uses the same UART
+  driver as the one-Node firmware. Nodes 3 and 4 use new receive code (`src/piolink.rs`:
+  PIO state machines emptied by DMA) that has only been compiled.
 
 W6300: SPI0 SCK GP18, MOSI GP19, MISO GP16, CS GP17, RST GP20, INT GP21 (Waveshare's
 `DEV_Config.h`). Board extras not used yet: WS2812 on GP25, USB detect GP24, PoE detect
@@ -158,8 +181,9 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 
 ## What it does
 
-- `node.rs`: decodes Node-link frames (COBS + CRC-16) into `oft_core::NodeHost`, sends `Plan`
-  and `Ping`, pulses SYNC at 20 Hz, resets the C5 at boot via EN/BOOT.
+- `node.rs`: per Node, decodes Node-link frames (COBS + CRC-16) into `oft_core::Hosts`, sends
+  its `Plan` and `Ping`; pulses SYNC at 20 Hz; resets the C5s at boot via EN/BOOT.
+  `piolink.rs` is the serial link for Nodes 3 and 4.
 - `state.rs`: shared state behind a critical-section mutex; 64-crossing replay buffer; a 100 Hz,
   30 s trace per seat for `/samples`; a pub/sub channel feeding WebSocket clients.
 - `web.rs`: picoserve HTTP + WebSocket: `/oft/v1/{info,config,status,time,crossings,samples,

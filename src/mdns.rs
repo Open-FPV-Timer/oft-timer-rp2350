@@ -26,7 +26,7 @@ struct Facts {
 
 fn facts(timer: &Timer, stack: Stack<'static>) -> Option<Facts> {
     let addr = stack.config_v4()?.address.address().octets();
-    let (seats, nodes) = timer.with(|i| (i.config.enabled_seats().count() as u8, i.host.hello().is_some() as u8));
+    let (seats, nodes) = timer.with(|i| (i.config.enabled_seats().count() as u8, (0..i.node_count()).filter(|&n| i.hosts.hello(n).is_some()).count() as u8));
     Some(Facts { addr, seats, nodes })
 }
 

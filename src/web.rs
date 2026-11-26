@@ -1,7 +1,7 @@
 //! The OFT Protocol (spec §6) over picoserve: `/oft/v1/{info,config,status,time,crossings,
 //! samples,stream}`. JSON is built with serde-json-core into fixed buffers.
 
-use crate::board::{Pins, OFT_PORT, OUT_PINS, RX_PINS, TX_PINS};
+use crate::board::{NodePins, Pins, MAX_NODES, OFT_PORT, OUT_PINS};
 use crate::fw::{Fw, Other};
 use crate::state::{Config, Event, NetConfig, NetNow, Saved, SeatConfig, ThresholdConfig, Timer, MAX_SEATS, TRACE_DT_US};
 use core::fmt::Write as _;
@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 /// connection is refused outright. Four was too few for the page plus one other client.
 pub const WEB_TASK_POOL_SIZE: usize = 8;
 
-/// Capacity of a JSON body built in place. The largest is the WebSocket `hello` with eight
-/// seats enabled, a little over 1 KiB.
+/// Capacity of a JSON body built in place. Every connection task holds several of these, so
+/// it is kept to what the ordinary replies need.
 const BODY: usize = 1280;
+/// Capacity for the two bodies that grow with the number of Nodes: `info` (the WebSocket
+/// `hello`) and `status`. Eight seats and four Nodes come to about 2.4 KiB.
+const BIG: usize = 2560;
 
 #[derive(Clone, Copy)]
 pub struct AppState(pub &'static Timer, pub &'static Fw);
@@ -65,7 +68,23 @@ struct SeatStatusJson {
     crossing: bool,
 }
 
-/// Health of the Node link, so lost samples can be traced to their cause (counts since boot).
+/// One Node's part of `status`.
+#[derive(Serialize)]
+struct NodeStatusJson {
+    /// Which of the Timer's Node links it is on, from 0.
+    slot: u8,
+    /// Null until the Node has introduced itself.
+    id: Option<String<16>>,
+    connected: bool,
+    temp_c: Option<f32>,
+    clock_synced: bool,
+    clock_source: &'static str,
+    clock_err_us: Option<f64>,
+    drift_ppm: Option<f64>,
+    link: LinkJson,
+}
+
+/// Health of a Node link, so lost samples can be traced to their cause (counts since boot).
 #[derive(Serialize)]
 struct LinkJson {
     gap_samples: u32,
@@ -91,6 +110,9 @@ struct StatusJson {
     drift_ppm: Option<f64>,
     node_connected: bool,
     link: LinkJson,
+    /// Every wired Node. The Node fields above sum these up: the worst clock, the highest
+    /// temperature, the counts added together, `node_connected` only if all are.
+    nodes: Vec<NodeStatusJson, MAX_NODES>,
     seats: Vec<SeatStatusJson, MAX_SEATS>,
     /// WebSocket streams open now.
     clients: u32,
@@ -269,11 +291,23 @@ pub(crate) fn parse_net(address: &str, prefix: u8, gateway: Option<&str>) -> Res
     NetJson { mode: String::try_from("static").unwrap(), address: Some(text(address)?), prefix: Some(prefix), gateway: gateway.map(text).transpose()?, dns: None }.into_net()
 }
 
-/// The Node's pins as GPIO numbers: the body of `PUT /pins`, and how they are stored.
 #[derive(Serialize, Deserialize, Clone, Copy)]
-pub(crate) struct PinsJson {
+struct NodePinsJson {
     tx: u8,
     rx: u8,
+}
+
+/// The Node wiring as GPIO numbers: the body of `PUT /pins`, and how it is stored. One
+/// entry in `nodes` per Node, Node 1 first.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct PinsJson {
+    #[serde(default)]
+    nodes: Vec<NodePinsJson, MAX_NODES>,
+    /// Firmware that drove one Node stored its link here; still read, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tx: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rx: Option<u8>,
     sync: u8,
     en: u8,
     boot: u8,
@@ -281,13 +315,20 @@ pub(crate) struct PinsJson {
 
 impl From<Pins> for PinsJson {
     fn from(p: Pins) -> Self {
-        PinsJson { tx: p.tx, rx: p.rx, sync: p.sync, en: p.en, boot: p.boot }
+        PinsJson { nodes: p.nodes.iter().flatten().map(|n| NodePinsJson { tx: n.tx, rx: n.rx }).collect(), tx: None, rx: None, sync: p.sync, en: p.en, boot: p.boot }
     }
 }
 
 impl PinsJson {
     fn into_pins(self) -> Result<Pins, &'static str> {
-        let p = Pins { tx: self.tx, rx: self.rx, sync: self.sync, en: self.en, boot: self.boot };
+        let mut nodes = [None; MAX_NODES];
+        for (slot, n) in nodes.iter_mut().zip(&self.nodes) {
+            *slot = Some(NodePins { tx: n.tx, rx: n.rx });
+        }
+        if let (true, Some(tx), Some(rx)) = (self.nodes.is_empty(), self.tx, self.rx) {
+            nodes[0] = Some(NodePins { tx, rx });
+        }
+        let p = Pins { nodes, sync: self.sync, en: self.en, boot: self.boot };
         p.check().map(|()| p)
     }
 }
@@ -322,9 +363,15 @@ impl SavedJson {
 }
 
 #[derive(Serialize)]
-struct PinChoicesJson {
+struct NodePinChoicesJson {
     tx: &'static [u8],
     rx: &'static [u8],
+}
+
+#[derive(Serialize)]
+struct PinChoicesJson {
+    /// What each Node's link may use, Node 1 first: as many entries as the Timer can drive.
+    nodes: [NodePinChoicesJson; MAX_NODES],
     /// For `sync`, `en` and `boot`.
     out: &'static [u8],
 }
@@ -382,22 +429,23 @@ struct SamplesQ {
 
 // ------------------------------------------------------------------ builders
 
+fn node_id(h: &oft_nodelink::msg::Hello) -> String<16> {
+    let mut id = String::new();
+    let _ = write!(id, "{:012x}", h.chip_id);
+    id
+}
+
 fn status_json(t: &Timer) -> StatusJson {
     t.with(|i| {
-        let clock = i.host.clock();
-        let node: Option<String<16>> = i.host.hello().map(|h| {
-            let mut id = String::new();
-            let _ = write!(id, "{:012x}", h.chip_id);
-            id
-        });
+        let count = i.node_count();
         let mut seats = Vec::new();
         for s in i.config.enabled_seats() {
-            let det = i.host.detector(s.seat);
+            let det = i.hosts.detector(s.seat);
             let (enter, exit) = det.map(|d| d.levels()).unwrap_or((0, 0));
             let tr = i.traces.get(s.seat as usize).and_then(|t| t.as_ref());
             let _ = seats.push(SeatStatusJson {
                 seat: s.seat,
-                node: node.clone(),
+                node: i.hosts.seat_node(s.seat).and_then(|n| i.hosts.hello(n as usize)).map(node_id),
                 rate_hz: tr.map(|t| t.rate_hz).unwrap_or(0),
                 rssi: tr.map(|t| t.last_rssi),
                 floor: det.and_then(|d| d.floor()),
@@ -406,27 +454,65 @@ fn status_json(t: &Timer) -> StatusJson {
                 crossing: det.is_some_and(|d| d.is_crossing()),
             });
         }
+        let mut nodes: Vec<NodeStatusJson, MAX_NODES> = Vec::new();
+        // The Node whose clock says most about the Timer's: the first connected one that is
+        // not synced, else the connected one with the largest error.
+        let mut worst = 0;
+        let mut worst_err = -1.0;
+        for n in 0..count {
+            let (link, st) = (i.hosts.link(n), &i.nodes[n]);
+            let clock = link.clock();
+            if st.connected {
+                let err = if clock.is_synced() { clock.residual_us() } else { f64::INFINITY };
+                if err > worst_err {
+                    (worst, worst_err) = (n, err);
+                }
+            }
+            let _ = nodes.push(NodeStatusJson {
+                slot: n as u8,
+                id: link.hello().map(node_id),
+                connected: st.connected,
+                temp_c: st.temp_dc.map(|t| t as f32 / 10.0),
+                clock_synced: clock.is_synced(),
+                clock_source: link.sync_source(),
+                clock_err_us: clock.is_synced().then(|| clock.residual_us()),
+                drift_ppm: clock.is_synced().then(|| clock.drift_ppm()),
+                link: LinkJson {
+                    gap_samples: link.dropped_samples,
+                    crc_errors: st.dropped_frames,
+                    uart_errors: st.uart_errors,
+                    node_overruns: st.status.map(|s| s.overruns),
+                    node_hop_errors: st.status.map(|s| s.hop_errors),
+                    node_gain: st.status.map(|s| s.gain_index),
+                },
+            });
+        }
+        let sum = |f: fn(&LinkJson) -> u32| nodes.iter().fold(0u32, |a, n| a.wrapping_add(f(&n.link)));
+        let sum_opt = |f: fn(&LinkJson) -> Option<u16>| nodes.iter().filter_map(|n| f(&n.link)).reduce(|a, b| a.saturating_add(b));
+        let link = LinkJson {
+            gap_samples: sum(|l| l.gap_samples),
+            crc_errors: sum(|l| l.crc_errors),
+            uart_errors: sum(|l| l.uart_errors),
+            node_overruns: sum_opt(|l| l.node_overruns),
+            node_hop_errors: sum_opt(|l| l.node_hop_errors),
+            node_gain: nodes.first().and_then(|n| n.link.node_gain),
+        };
         let now = crate::state::now_us();
+        let w = nodes.get(worst);
         StatusJson {
             kind: "status",
             uptime_s: now / 1_000_000,
             time_us: now,
-            temp_c: i.node_temp_dc.map(|t| t as f32 / 10.0),
+            temp_c: nodes.iter().filter_map(|n| n.temp_c).reduce(f32::max),
             timer_temp_c: i.timer_temp_dc.map(|t| t as f32 / 10.0),
-            dropped: i.host.dropped_samples.wrapping_add(i.dropped_frames),
-            clock_err_us: clock.is_synced().then(|| clock.residual_us()),
-            clock_synced: clock.is_synced(),
-            clock_source: i.host.sync_source(),
-            drift_ppm: clock.is_synced().then(|| clock.drift_ppm()),
-            node_connected: i.node_connected,
-            link: LinkJson {
-                gap_samples: i.host.dropped_samples,
-                crc_errors: i.dropped_frames,
-                uart_errors: i.uart_errors,
-                node_overruns: i.node_status.map(|s| s.overruns),
-                node_hop_errors: i.node_status.map(|s| s.hop_errors),
-                node_gain: i.node_status.map(|s| s.gain_index),
-            },
+            dropped: link.gap_samples.wrapping_add(link.crc_errors),
+            clock_err_us: w.and_then(|n| n.clock_err_us),
+            clock_synced: w.is_some_and(|n| n.clock_synced),
+            clock_source: w.map_or("none", |n| n.clock_source),
+            drift_ppm: w.and_then(|n| n.drift_ppm),
+            node_connected: !nodes.is_empty() && nodes.iter().all(|n| n.connected),
+            link,
+            nodes,
             seats,
             clients: WS_CLIENTS.load(portable_atomic::Ordering::Relaxed),
             config_rev: i.config_rev,
@@ -436,16 +522,7 @@ fn status_json(t: &Timer) -> StatusJson {
 }
 
 /// `/info` and the WebSocket `hello` share this body; `hello` adds a few fields.
-fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) {
-    let h = t.hello();
-    let (seats, rate) = t.with(|i| {
-        let mut v: Vec<(u8, u32), MAX_SEATS> = Vec::new();
-        for s in i.config.enabled_seats() {
-            let r = i.traces.get(s.seat as usize).and_then(|t| t.as_ref()).map(|t| t.rate_hz).unwrap_or(0);
-            let _ = v.push((s.seat, r));
-        }
-        (v, 1000u32)
-    });
+fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BIG>) {
     out.clear();
     let _ = write!(out, "{{");
     if hello {
@@ -459,18 +536,51 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
         t.boot_id,
         env!("CARGO_PKG_VERSION")
     );
-    let _ = write!(out, "\"nodes\":[");
-    if let Some(h) = h {
-        let _ = write!(
-            out,
-            "{{\"id\":\"{:012x}\",\"chip\":\"{}\",\"fw\":\"{}.{}.{}\",\"range_mhz\":[{},{}],\"max_seats\":{},\"level\":{{\"unit\":\"{}\",\"scale\":{}}},\"link\":\"uart\"}}",
-            h.chip_id, h.chip_name(), h.fw[0], h.fw[1], h.fw[2], h.freq_min_mhz, h.freq_max_mhz, h.max_seats, h.level().unit(), h.level().scale()
-        );
-    }
-    let _ = write!(out, "],\"seats\":[");
-    for (k, (seat, r)) in seats.iter().enumerate() {
-        let _ = write!(out, "{}{{\"seat\":{},\"node\":0,\"rate_hz\":{}}}", if k > 0 { "," } else { "" }, seat, r);
-    }
+    let rate = 1000u32;
+    t.with(|i| {
+        // `nodes` lists the Nodes that have introduced themselves, in link order; a seat's
+        // `node` is its Node's place in that list.
+        let mut place = [None; MAX_NODES];
+        let _ = write!(out, "\"nodes\":[");
+        let mut listed = 0;
+        for n in 0..i.node_count() {
+            let Some(h) = i.hosts.hello(n) else { continue };
+            let _ = write!(
+                out,
+                "{}{{\"id\":\"{:012x}\",\"chip\":\"{}\",\"fw\":\"{}.{}.{}\",\"range_mhz\":[{},{}],\"max_seats\":{},\"level\":{{\"unit\":\"{}\",\"scale\":{}}},\"link\":\"uart\",\"slot\":{},\"connected\":{}}}",
+                if listed > 0 { "," } else { "" },
+                h.chip_id,
+                h.chip_name(),
+                h.fw[0],
+                h.fw[1],
+                h.fw[2],
+                h.freq_min_mhz,
+                h.freq_max_mhz,
+                h.max_seats,
+                h.level().unit(),
+                h.level().scale(),
+                n,
+                i.nodes[n].connected
+            );
+            place[n] = Some(listed);
+            listed += 1;
+        }
+        let _ = write!(out, "],\"seats\":[");
+        for (k, s) in i.config.enabled_seats().enumerate() {
+            let r = i.traces.get(s.seat as usize).and_then(|t| t.as_ref()).map(|t| t.rate_hz).unwrap_or(0);
+            let _ = write!(out, "{}{{\"seat\":{},\"node\":", if k > 0 { "," } else { "" }, s.seat);
+            match i.hosts.seat_node(s.seat).and_then(|n| place[n as usize]) {
+                Some(p) => {
+                    let _ = write!(out, "{}", p);
+                }
+                // No Node is serving it (none answering, or none with room).
+                None => {
+                    let _ = out.push_str("null");
+                }
+            }
+            let _ = write!(out, ",\"rate_hz\":{}}}", r);
+        }
+    });
     let _ = write!(
         out,
         "],\"capabilities\":{{\"crossings\":{{\"algorithms\":[\"edge_mid\"],\"replay\":{},\"fields\":[\"t_enter\",\"t_exit\",\"peak\",\"snr\"]}},\
@@ -478,7 +588,7 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
          \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true,\"pass_window_ms\":true}},\
          \"network\":{{\"static\":true}},\
-         \"pins\":{{}},\
+         \"pins\":{{\"max_nodes\":{}}},\
          \"control\":{{}},\
          \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
          \"fw.update\":{{\"nodes\":[\"uart\"],\"self\":{}}}}}}}",
@@ -486,6 +596,7 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BODY>) 
         rate,
         crate::state::TRACE_LEN as u64 * TRACE_DT_US / 1_000_000,
         1_000_000 / TRACE_DT_US,
+        MAX_NODES,
         // Present when this build has the serial console on the USB-C port.
         if cfg!(feature = "usb-console") { "\"usb.console\":{}," } else { "" },
         self_update
@@ -535,6 +646,23 @@ impl IntoResponse for RawJson {
         response_writer: W,
     ) -> Result<picoserve::ResponseSent, W::Error> {
         Response::new(self.0, JsonBody(self.1)).write_to(connection, response_writer).await
+    }
+}
+
+/// The `/info` body. It outgrows `RawJson`, and a body that size carried in the reply would
+/// be copied into every connection task several times over. Sent chunked instead: it is
+/// built once, where it is written.
+struct InfoChunks(&'static Timer, bool);
+
+impl picoserve::response::chunked::Chunks for InfoChunks {
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+    async fn write_chunks<W: picoserve::io::Write>(self, mut chunk_writer: picoserve::response::chunked::ChunkWriter<W>) -> Result<picoserve::response::chunked::ChunksWritten, W::Error> {
+        let mut s: String<BIG> = String::new();
+        info_json(self.0, self.1, false, &mut s);
+        chunk_writer.write_chunk(s.as_bytes()).await?;
+        chunk_writer.finalize().await
     }
 }
 
@@ -680,11 +808,9 @@ impl Drop for StreamClaim {
 
 // ------------------------------------------------------------------ handlers
 
-async fn info(State(AppState(t, fw)): State<AppState>) -> RawJson {
+async fn info(State(AppState(t, fw)): State<AppState>) -> picoserve::response::chunked::ChunkedResponse<InfoChunks> {
     fw.note_http();
-    let mut s = String::new();
-    info_json(t, fw.self_update(), false, &mut s);
-    RawJson::ok(s)
+    picoserve::response::chunked::ChunkedResponse::new(InfoChunks(t, fw.self_update()))
 }
 
 async fn status(State(AppState(t, _)): State<AppState>) -> Json<StatusJson> {
@@ -777,7 +903,7 @@ fn pins_state(t: &Timer) -> RawJson {
             saved: i.saved.pins.into(),
             using: i.pins_boot.into(),
             defaults: Pins::default().into(),
-            choices: PinChoicesJson { tx: &TX_PINS, rx: &RX_PINS, out: &OUT_PINS },
+            choices: PinChoicesJson { nodes: core::array::from_fn(|n| NodePinChoicesJson { tx: crate::board::tx_pins(n), rx: crate::board::rx_pins(n) }), out: &OUT_PINS },
             restart_needed: i.saved.pins != i.pins_boot,
         }),
     )
@@ -835,7 +961,7 @@ async fn samples(State(AppState(t, _)): State<AppState>, Query(q): Query<Samples
     let ok = t.with(|i| {
         let Some(tr) = i.traces.get(q.seat as usize).and_then(|t| t.as_ref()) else { return false };
         let t_first = tr.t_first();
-        let floor = i.host.detector(q.seat).and_then(|d| d.floor()).unwrap_or(0);
+        let floor = i.hosts.detector(q.seat).and_then(|d| d.floor()).unwrap_or(0);
         let mut first_t = None;
         let mut body: String<800> = String::new();
         for (k, &p) in tr.samples.iter().enumerate() {
@@ -935,9 +1061,11 @@ impl ws::WebSocketCallback for Stream {
         let mut decim: [u32; MAX_SEATS] = [0; MAX_SEATS];
         let mut in_buf = [0u8; 512];
         let mut body: String<BODY> = String::new();
+        // `hello` and `status` are built here; both outgrow `body`.
+        let mut big: String<BIG> = String::new();
 
-        info_json(t, self.1.self_update(), true, &mut body);
-        tx.send_text(body.as_str()).await?;
+        info_json(t, self.1.self_update(), true, &mut big);
+        tx.send_text(big.as_str()).await?;
         control_msg(t, claim.1, &mut body);
         tx.send_text(body.as_str()).await?;
 
@@ -1028,10 +1156,13 @@ impl ws::WebSocketCallback for Stream {
                         tx.send_text(body.as_str()).await?;
                     }
                     Event::Status if want_status => {
-                        // Eight seats with a holder's name come to about 1.3 KiB.
-                        let mut buf = [0u8; 1536];
-                        if let Ok(n) = serde_json_core::to_slice(&status_json(t), &mut buf) {
-                            tx.send_text(core::str::from_utf8(&buf[..n]).unwrap_or("{}")).await?;
+                        // Safety: `to_slice` writes valid UTF-8, and `n` is how much of it.
+                        let buf = unsafe { big.as_mut_vec() };
+                        let _ = buf.resize(BIG, 0);
+                        let n = serde_json_core::to_slice(&status_json(t), buf).unwrap_or(0);
+                        buf.truncate(n);
+                        if n > 0 {
+                            tx.send_text(big.as_str()).await?;
                         }
                     }
                     _ => {}
@@ -1050,27 +1181,44 @@ fn opt_bool(v: Option<bool>) -> &'static str {
     }
 }
 
-/// Progress and result of the Node wiring test.
+/// Progress and result of the Node wiring test. The top-level verdicts are for all the
+/// Nodes together (the slowest time, and a pass only if every Node passed); `nodes` has
+/// each one's.
 async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
-    let w = t.with(|i| i.wire_test);
+    let (w, count) = t.with(|i| (i.wire_test, i.node_count()));
+    let nodes = &w.nodes[..count];
+    let all = |f: fn(&crate::state::NodeWireTest) -> Option<bool>| nodes.iter().map(f).try_fold(true, |a, v| v.map(|v| a && v));
     let mut s = String::new();
     let _ = write!(
         s,
-        "{{\"running\":{},\"done\":{},\"step\":\"{}\",\"en_ok\":{},\"en_ms\":{},\"boot_ok\":{},\"recovered\":{},\"recover_ms\":{}}}",
+        "{{\"running\":{},\"done\":{},\"step\":\"{}\",\"en_ok\":{},\"en_ms\":{},\"boot_ok\":{},\"recovered\":{},\"recover_ms\":{},\"nodes\":[",
         w.running,
         w.done,
         w.step,
-        opt_bool(w.en_ok),
-        w.en_ms,
-        opt_bool(w.boot_ok),
-        opt_bool(w.recovered),
-        w.recover_ms
+        opt_bool(all(|n| n.en_ok)),
+        nodes.iter().map(|n| n.en_ms).max().unwrap_or(0),
+        opt_bool(all(|n| n.boot_ok)),
+        opt_bool(all(|n| n.recovered)),
+        nodes.iter().map(|n| n.recover_ms).max().unwrap_or(0)
     );
+    for (k, n) in nodes.iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"en_ok\":{},\"en_ms\":{},\"boot_ok\":{},\"recovered\":{},\"recover_ms\":{}}}",
+            if k > 0 { "," } else { "" },
+            opt_bool(n.en_ok),
+            n.en_ms,
+            opt_bool(n.boot_ok),
+            opt_bool(n.recovered),
+            n.recover_ms
+        );
+    }
+    let _ = s.push_str("]}");
     RawJson::ok(s)
 }
 
 /// Start the Node wiring test (EN and BOOT lines). Bench diagnostic, not part of the OFT
-/// Protocol: it resets the Node three times and stops timing while it runs.
+/// Protocol: it resets the Nodes three times and stops timing while it runs.
 async fn post_wiretest(State(state): State<AppState>, _: Writer) -> RawJson {
     let t = state.0;
     // Check and claim in one step, so the test and a Node firmware write cannot both start.
@@ -1255,11 +1403,11 @@ async fn fw_receive<R: picoserve::io::Read>(fw: &'static Fw, request: &mut picos
 struct NodeUpload;
 
 fn node_flash_json(t: &Timer) -> RawJson {
-    let (f, connected) = t.with(|i| (i.node_flash, i.node_connected));
+    let (f, connected) = t.with(|i| (i.node_flash, (0..i.node_count()).all(|n| i.nodes[n].connected)));
     let mut s: String<BODY> = String::new();
     let _ = write!(
         s,
-        "{{\"supported\":true,\"running\":{},\"done\":{},\"ok\":{},\"step\":\"{}\",\"error\":\"{}\",\"offset\":{},\"bytes\":{},\"written\":{},\"baud\":{},\"seconds\":{},\"node_connected\":{},\"max_bytes\":{}",
+        "{{\"supported\":true,\"running\":{},\"done\":{},\"ok\":{},\"step\":\"{}\",\"error\":\"{}\",\"offset\":{},\"bytes\":{},\"written\":{},\"baud\":{},\"seconds\":{},\"node\":{},\"nodes\":{},\"nodes_done\":{},\"node_connected\":{},\"max_bytes\":{}",
         f.running,
         f.done,
         f.ok,
@@ -1270,6 +1418,9 @@ fn node_flash_json(t: &Timer) -> RawJson {
         f.written,
         f.baud,
         f.seconds,
+        f.node,
+        f.nodes,
+        f.nodes_done,
         connected,
         oft_fwimage::layout::NODE_STORE_BYTES
     );
@@ -1292,9 +1443,10 @@ async fn get_fw_node(State(AppState(t, _)): State<AppState>) -> RawJson {
     node_flash_json(t)
 }
 
-/// `offset` and `baud` from the query string, with their defaults.
-fn node_query(query: Option<&str>) -> Result<(u32, u32), &'static str> {
-    let (mut offset, mut baud) = (oft_fwimage::esprom::C5_APP_OFFSET, 115_200u32);
+/// `offset`, `baud` and `node` from the query string, with their defaults. `node` is the
+/// Node to write, from 0; without it every wired Node is written, one after the other.
+fn node_query(query: Option<&str>, nodes: usize) -> Result<(u32, u32, Option<u8>), &'static str> {
+    let (mut offset, mut baud, mut node) = (oft_fwimage::esprom::C5_APP_OFFSET, 115_200u32, None);
     for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let n = match v.strip_prefix("0x") {
@@ -1304,14 +1456,16 @@ fn node_query(query: Option<&str>) -> Result<(u32, u32), &'static str> {
         match (k, n) {
             ("offset", Ok(n)) => offset = n,
             ("baud", Ok(n)) => baud = n,
-            ("offset" | "baud", Err(_)) => return Err("offset and baud must be numbers"),
+            ("node", Ok(n)) if (n as usize) < nodes => node = Some(n as u8),
+            ("node", Ok(_)) => return Err("there is no Node with that number"),
+            ("offset" | "baud" | "node", Err(_)) => return Err("offset, baud and node must be numbers"),
             _ => {}
         }
     }
     if ![115_200, 230_400, 460_800, 921_600].contains(&baud) {
         return Err("baud must be 115200, 230400, 460800 or 921600");
     }
-    Ok((offset, baud))
+    Ok((offset, baud, node))
 }
 
 async fn node_receive<R: picoserve::io::Read>(t: &'static Timer, fw: &'static Fw, request: &mut picoserve::request::Request<'_, R>) -> Result<RawJson, R::Error> {
@@ -1321,10 +1475,10 @@ async fn node_receive<R: picoserve::io::Read>(t: &'static Timer, fw: &'static Fw
     use picoserve::io::Read as _;
     const SECTOR: usize = SECTOR_BYTES as usize;
     let len = request.body_connection.content_length();
-    let query = node_query(request.parts.query().map(|q| q.0));
+    let query = node_query(request.parts.query().map(|q| q.0), t.with(|i| i.node_count()));
     let mut reader = request.body_connection.body().reader().with_different_timeout(embassy_time::Duration::from_secs(60));
     let refuse = |code: u16, m: &'static str| RawJson::error(code, m);
-    let (offset, baud) = match query {
+    let (offset, baud, node) = match query {
         Ok(q) => q,
         Err(m) => {
             drain(&mut reader).await?;
@@ -1415,7 +1569,7 @@ async fn node_receive<R: picoserve::io::Read>(t: &'static Timer, fw: &'static Fw
     if !claimed {
         return Ok(refuse(409, "the Node is already being written or tested; wait for that to finish"));
     }
-    crate::node::NODE_FLASH.signal(crate::node::NodeJob { offset, len: len as u32, md5: digest, baud });
+    crate::node::NODE_FLASH.signal(crate::node::NodeJob { offset, len: len as u32, md5: digest, baud, node });
     let mut reply = node_flash_json(t);
     reply.0 = StatusCode::ACCEPTED;
     Ok(reply)

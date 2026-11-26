@@ -18,29 +18,42 @@ pub mod eth {
     pub const SPI_HZ: u32 = 30_000_000;
 }
 
-/// The C5 Node on UART1: the default pins.
+/// Nodes one Timer can drive, each on its own serial link.
+pub const MAX_NODES: usize = 4;
+
+/// The first Node's default pins, and what every Node shares.
 pub mod node {
     /// RP2350 TX -> XIAO D7 (ESP32-C5 GPIO12, UART0 RX).
     pub const TX: u8 = 4;
     /// RP2350 RX <- XIAO D6 (ESP32-C5 GPIO11, UART0 TX).
     pub const RX: u8 = 5;
     pub const BAUD: u32 = 921_600;
-    /// SYNC pulse output, wired to a C5 input the Node firmware latches.
+    /// SYNC pulse output, one wire to every Node's SYNC input.
     pub const SYNC: u8 = 6;
-    /// C5 EN (reset), active low.
+    /// C5 EN (reset), active low. One wire to every Node.
     pub const EN: u8 = 7;
-    /// C5 BOOT strap (GPIO28 on the C5 per Espressif; confirm on the XIAO), low = download mode.
+    /// C5 BOOT strap, low = download mode. One wire to every Node.
     pub const BOOT: u8 = 8;
 }
 
-/// Which header GPIOs carry the Node's five signals. Read from the saved settings at
-/// start-up, so a board wired differently needs a setting, not its own firmware.
+/// One Node's serial link.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NodePins {
+    /// To the Node's RX.
+    pub tx: u8,
+    /// From the Node's TX.
+    pub rx: u8,
+}
+
+/// Which header GPIOs carry the Node wiring. Read from the saved settings at start-up, so a
+/// board wired differently needs a setting, not its own firmware.
+///
+/// How many Nodes the Timer drives is how many links are listed. Each Node has its own
+/// link; SYNC, EN and BOOT are each one wire shared by every Node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Pins {
-    /// UART1 TX, to the Node's RX.
-    pub tx: u8,
-    /// UART1 RX, from the Node's TX.
-    pub rx: u8,
+    /// Node 1 first; filled from the front.
+    pub nodes: [Option<NodePins>; MAX_NODES],
     pub sync: u8,
     pub en: u8,
     pub boot: u8,
@@ -48,30 +61,72 @@ pub struct Pins {
 
 impl Default for Pins {
     fn default() -> Self {
-        Self { tx: node::TX, rx: node::RX, sync: node::SYNC, en: node::EN, boot: node::BOOT }
+        Self { nodes: [Some(NodePins { tx: node::TX, rx: node::RX }), None, None, None], sync: node::SYNC, en: node::EN, boot: node::BOOT }
     }
 }
 
-/// Header GPIOs UART1 can transmit on (the RP2350's function table; `main.rs` spells out
-/// the same list as pin types).
-pub const TX_PINS: [u8; 6] = [4, 6, 8, 10, 22, 26];
-/// Header GPIOs UART1 can receive on. GP9 could too, but it is the recovery jumper.
-pub const RX_PINS: [u8; 4] = [5, 7, 11, 27];
-/// Header GPIOs free to be a plain output (SYNC, EN, BOOT): every header GPIO but GP9.
+/// How each Node's link is driven: Node 1 on UART1, Node 2 on UART0, Nodes 3 and 4 on PIO
+/// state machines (a UART in software, on any pin).
+pub const HW_UARTS: usize = 2;
+/// Header GPIOs each hardware UART can transmit on (the RP2350's function table; `main.rs`
+/// spells out the same lists as pin types).
+const UART_TX_PINS: [&[u8]; HW_UARTS] = [&[4, 6, 8, 10, 22, 26], &[0, 2, 12, 14, 28]];
+/// Header GPIOs each hardware UART can receive on. UART1 could use GP9 too, but it is the
+/// recovery jumper.
+const UART_RX_PINS: [&[u8]; HW_UARTS] = [&[5, 7, 11, 27], &[1, 3, 13, 15]];
+/// Header GPIOs free to be a plain output (SYNC, EN, BOOT) or a PIO link pin: every header
+/// GPIO but GP9.
 pub const OUT_PINS: [u8; 19] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 22, 26, 27, 28];
 
+/// The pins Node `slot`'s link can transmit on.
+pub fn tx_pins(slot: usize) -> &'static [u8] {
+    UART_TX_PINS.get(slot).copied().unwrap_or(&OUT_PINS)
+}
+
+/// The pins Node `slot`'s link can receive on.
+pub fn rx_pins(slot: usize) -> &'static [u8] {
+    UART_RX_PINS.get(slot).copied().unwrap_or(&OUT_PINS)
+}
+
 impl Pins {
+    /// How many Nodes are wired.
+    pub fn node_count(&self) -> usize {
+        self.nodes.iter().take_while(|n| n.is_some()).count()
+    }
+
     /// Why these pins cannot be used, if they cannot.
     pub fn check(&self) -> Result<(), &'static str> {
-        if !TX_PINS.contains(&self.tx) {
-            return Err("tx must be one of GP4, GP6, GP8, GP10, GP22, GP26 (the pins UART1 can transmit on)");
+        let n = self.node_count();
+        if n == 0 {
+            return Err("at least one Node link is needed");
         }
-        if !RX_PINS.contains(&self.rx) {
-            return Err("rx must be one of GP5, GP7, GP11, GP27 (the pins UART1 can receive on)");
+        if self.nodes[n..].iter().any(|p| p.is_some()) {
+            return Err("Node links must be listed without gaps");
         }
-        let all = [self.tx, self.rx, self.sync, self.en, self.boot];
-        if !all[2..].iter().all(|p| OUT_PINS.contains(p)) {
-            return Err("sync, en and boot must be header GPIOs: 0-8, 10-15, 22, 26-28");
+        let mut all: heapless::Vec<u8, { 2 * MAX_NODES + 3 }> = heapless::Vec::new();
+        for (slot, p) in self.nodes.iter().flatten().enumerate() {
+            if !tx_pins(slot).contains(&p.tx) {
+                return Err(match slot {
+                    0 => "Node 1 tx must be one of GP4, GP6, GP8, GP10, GP22, GP26 (the pins UART1 can transmit on)",
+                    1 => "Node 2 tx must be one of GP0, GP2, GP12, GP14, GP28 (the pins UART0 can transmit on)",
+                    _ => "tx must be a header GPIO: 0-8, 10-15, 22, 26-28",
+                });
+            }
+            if !rx_pins(slot).contains(&p.rx) {
+                return Err(match slot {
+                    0 => "Node 1 rx must be one of GP5, GP7, GP11, GP27 (the pins UART1 can receive on)",
+                    1 => "Node 2 rx must be one of GP1, GP3, GP13, GP15 (the pins UART0 can receive on)",
+                    _ => "rx must be a header GPIO: 0-8, 10-15, 22, 26-28",
+                });
+            }
+            let _ = all.push(p.tx);
+            let _ = all.push(p.rx);
+        }
+        for p in [self.sync, self.en, self.boot] {
+            if !OUT_PINS.contains(&p) {
+                return Err("sync, en and boot must be header GPIOs: 0-8, 10-15, 22, 26-28");
+            }
+            let _ = all.push(p);
         }
         if (1..all.len()).any(|k| all[..k].contains(&all[k])) {
             return Err("each signal needs its own pin");

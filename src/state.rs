@@ -1,4 +1,4 @@
-//! The Timer's shared state: one Node's `NodeHost`, the config, crossing replay, a reduced
+//! The Timer's shared state: the Nodes' `Hosts`, the config, crossing replay, a reduced
 //! sample trace per seat, and the pub/sub channel the WebSocket clients drink from.
 //!
 //! Guarded by a blocking critical-section mutex: every access is short and never awaits.
@@ -8,8 +8,8 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMu
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::pubsub::PubSubChannel;
 use heapless::Deque;
-use oft_core::{Crossing, DetectConfig, NodeHost, Threshold};
-use oft_nodelink::msg::{Hello, Plan, GAIN_AUTO};
+use crate::board::MAX_NODES;
+use oft_core::{Crossing, DetectConfig, Hosts, NodeMask, Threshold};
 
 pub const MAX_SEATS: usize = 8;
 /// Crossings kept for `/crossings?since=` and WebSocket replay.
@@ -96,21 +96,11 @@ impl Config {
         }
     }
 
-    pub fn plan(&self) -> Plan {
-        let mut p = Plan::with(0, 0, GAIN_AUTO);
-        // One Node: every enabled seat goes to it (a Plan holds as many as there are seats).
-        for s in self.seats.iter().flatten().filter(|s| s.enabled) {
-            let _ = p.push(s.seat, s.freq_mhz);
-        }
-        p
-    }
-
-    /// Give the host the shared detection settings and each seat's own threshold. Call
-    /// before `set_plan`, which builds the detectors from them.
-    pub fn apply_detection(&self, host: &mut NodeHost) {
-        host.set_detect_config(self.detect());
+    /// Give the hosts the shared detection settings and each seat's own threshold.
+    pub fn apply_detection(&self, hosts: &mut Hosts<MAX_NODES>) {
+        hosts.set_detect_config(self.detect());
         for (seat, s) in self.seats.iter().enumerate() {
-            host.set_seat_threshold(seat as u8, s.and_then(|s| s.threshold).map(Into::into));
+            hosts.set_seat_threshold(seat as u8, s.and_then(|s| s.threshold).map(Into::into));
         }
     }
 
@@ -173,12 +163,18 @@ impl Trace {
     }
 }
 
-/// Progress and result of the Node wiring test (`node::node_ctl_task`).
+/// Progress and result of the Node wiring test (`node::node_ctl_task`). EN and BOOT are
+/// one wire each to every Node, so the test runs on all of them and reports each.
 #[derive(Clone, Copy, Default)]
 pub struct WireTest {
     pub running: bool,
     pub done: bool,
     pub step: &'static str,
+    pub nodes: [NodeWireTest; MAX_NODES],
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct NodeWireTest {
     /// EN: the Node restarted when the Timer pulsed its reset line.
     pub en_ok: Option<bool>,
     pub en_ms: u32,
@@ -189,7 +185,7 @@ pub struct WireTest {
     pub recover_ms: u32,
 }
 
-/// Progress and result of writing firmware to the Node (`node::node_ctl_task`).
+/// Progress and result of writing firmware to the Nodes (`node::node_ctl_task`).
 #[derive(Clone, Copy, Default)]
 pub struct NodeFlash {
     pub running: bool,
@@ -200,34 +196,49 @@ pub struct NodeFlash {
     /// Where in the Node's flash, and how much.
     pub offset: u32,
     pub total: u32,
+    /// Bytes written to the Node being written now.
     pub written: u32,
     pub baud: u32,
-    /// The Node came back on the Node link afterwards.
+    /// The Node being written now (or the one that failed), from 0.
+    pub node: u8,
+    /// Nodes this run writes, and how many are finished.
+    pub nodes: u8,
+    pub nodes_done: u8,
+    /// Every Node written came back on the Node link afterwards.
     pub returned: Option<bool>,
     pub seconds: u32,
 }
 
-pub struct Inner {
-    pub host: NodeHost,
-    pub config: Config,
-    pub crossings: Deque<(u64, Crossing), CROSSING_REPLAY>,
-    pub next_seq: u64,
-    pub traces: [Option<Trace>; MAX_SEATS],
-    pub node_connected: bool,
-    pub node_temp_dc: Option<i16>,
-    /// The RP2350's own die temperature, 0.1 °C.
-    pub timer_temp_dc: Option<i16>,
-    pub last_node_rx_us: Option<u64>,
+/// What the Timer knows about one Node link, beside what `Hosts` keeps.
+#[derive(Clone, Copy, Default)]
+pub struct NodeState {
+    /// Heard from in the last few seconds.
+    pub connected: bool,
+    pub last_rx_us: Option<u64>,
+    /// 0.1 °C.
+    pub temp_dc: Option<i16>,
+    /// The Node's last `Status` message.
+    pub status: Option<oft_nodelink::msg::Status>,
     /// Node-link frames that failed their checksum or framing.
     pub dropped_frames: u32,
     /// Errors the UART reported on receive (overrun, framing, noise, break).
     pub uart_errors: u32,
-    /// The Node's last `Status` message.
-    pub node_status: Option<oft_nodelink::msg::Status>,
+    /// The Node's plan changed (or it restarted); its link task sends it and clears this.
+    pub plan_dirty: bool,
+}
+
+pub struct Inner {
+    /// Clocks, detectors and the seat schedule for every Node.
+    pub hosts: Hosts<MAX_NODES>,
+    pub nodes: [NodeState; MAX_NODES],
+    pub config: Config,
+    pub crossings: Deque<(u64, Crossing), CROSSING_REPLAY>,
+    pub next_seq: u64,
+    pub traces: [Option<Trace>; MAX_SEATS],
+    /// The RP2350's own die temperature, 0.1 °C.
+    pub timer_temp_dc: Option<i16>,
     pub wire_test: WireTest,
     pub node_flash: NodeFlash,
-    /// Set by `set_config`; the node task sends the new plan and clears it.
-    pub plan_dirty: bool,
     /// What flash holds (kept in step by the save handlers).
     pub saved: Saved,
     /// The network settings this boot started with.
@@ -241,6 +252,65 @@ pub struct Inner {
     pub control: oft_core::control::Control<MAX_CLAIMS>,
     /// `config_rev` in `/status`: moves whenever the config or what is saved changes.
     pub config_rev: u32,
+}
+
+impl Inner {
+    /// Nodes wired to this Timer (the links in the pins this boot started with).
+    pub fn node_count(&self) -> usize {
+        self.pins_boot.node_count()
+    }
+
+    /// The Node each seat is on.
+    pub fn seat_nodes(&self) -> [Option<u8>; MAX_SEATS] {
+        core::array::from_fn(|s| self.hosts.seat_node(s as u8))
+    }
+
+    /// Change what the seat schedule depends on (`f` returns the Nodes whose plan changed),
+    /// then have those plans sent and start afresh the traces of seats that moved.
+    pub fn reschedule(&mut self, f: impl FnOnce(&mut Hosts<MAX_NODES>) -> NodeMask) {
+        let before = self.seat_nodes();
+        let changed = f(&mut self.hosts);
+        self.rescheduled(before, changed);
+    }
+
+    /// The schedule may have changed since `before` was read: have the plans of `changed`
+    /// sent, and start afresh the traces of seats that moved.
+    pub fn rescheduled(&mut self, before: [Option<u8>; MAX_SEATS], changed: NodeMask) {
+        self.plans_changed(changed);
+        for seat in 0..MAX_SEATS {
+            if self.hosts.seat_node(seat as u8) != before[seat] {
+                self.traces[seat] = None;
+            }
+        }
+    }
+
+    /// Have these Nodes' plans sent.
+    pub fn plans_changed(&mut self, nodes: NodeMask) {
+        for (k, n) in self.nodes.iter_mut().enumerate() {
+            if nodes & (1 << k) != 0 {
+                n.plan_dirty = true;
+            }
+        }
+    }
+
+    /// Node `n` was heard from at `t`. A Node back from a silence joins the schedule again.
+    pub fn node_heard(&mut self, n: usize, t: u64) {
+        self.nodes[n].last_rx_us = Some(t);
+        if !self.nodes[n].connected {
+            self.nodes[n].connected = true;
+            // Back after a restart, a flash or a cable: it may have no plan.
+            self.nodes[n].plan_dirty = true;
+            self.reschedule(|h| h.set_up(n, true));
+        }
+    }
+
+    /// Node `n` has gone quiet: the others take its seats.
+    pub fn node_lost(&mut self, n: usize) {
+        if self.nodes[n].connected {
+            self.nodes[n].connected = false;
+            self.reschedule(|h| h.set_up(n, false));
+        }
+    }
 }
 
 /// Standing control claims: one per stream, and `events` takes four subscribers.
@@ -271,26 +341,21 @@ pub enum Event {
 impl Timer {
     pub fn new(boot_id: u32, mac: [u8; 6], saved: Saved, net_boot: NetConfig, net_recovery: bool) -> Self {
         let config = saved.config.unwrap_or_default();
-        let mut host = NodeHost::new(config.detect());
-        config.apply_detection(&mut host);
-        host.set_plan(config.plan());
+        let mut hosts = Hosts::new(config.detect());
+        config.apply_detection(&mut hosts);
+        // No Node is up yet: seats are handed out as the Nodes report in.
+        hosts.set_seats(config.enabled_seats().map(|s| (s.seat, s.freq_mhz)));
         Self {
             inner: Mutex::new(RefCell::new(Inner {
-                host,
+                hosts,
+                nodes: [NodeState::default(); MAX_NODES],
                 config,
                 crossings: Deque::new(),
                 next_seq: 1,
                 traces: [const { None }; MAX_SEATS],
-                node_connected: false,
-                node_temp_dc: None,
                 timer_temp_dc: None,
-                last_node_rx_us: None,
-                dropped_frames: 0,
-                uart_errors: 0,
-                node_status: None,
-                wire_test: WireTest { running: false, done: false, step: "", en_ok: None, en_ms: 0, boot_ok: None, recovered: None, recover_ms: 0 },
-                node_flash: NodeFlash { running: false, done: false, ok: false, step: "", error: "", offset: 0, total: 0, written: 0, baud: 0, returned: None, seconds: 0 },
-                plan_dirty: true,
+                wire_test: WireTest::default(),
+                node_flash: NodeFlash::default(),
                 saved,
                 net_boot,
                 net_recovery,
@@ -312,25 +377,22 @@ impl Timer {
 
     pub fn set_config(&self, config: Config) {
         self.with(|i| {
-            config.apply_detection(&mut i.host);
-            // Only a change of seats or frequencies re-plans the Node. Re-planning restarts
-            // its sample stream (a gap of about 60 ms) and resets the detectors, so a change
-            // of levels alone must not do it.
-            let plan = config.plan();
-            if i.host.plan() != Some(&plan) {
-                i.host.set_plan(plan);
-                for t in i.traces.iter_mut() {
-                    *t = None;
+            config.apply_detection(&mut i.hosts);
+            // Only a change of seats or frequencies re-plans a Node, and only the Nodes it
+            // touches. Re-planning restarts a Node's sample stream (a gap of about 60 ms),
+            // and a seat that moves or retunes starts with a new detector, so a change of
+            // levels alone must not do it.
+            let old = i.config;
+            i.reschedule(|h| h.set_seats(config.enabled_seats().map(|s| (s.seat, s.freq_mhz))));
+            for seat in 0..MAX_SEATS {
+                let freq = |c: &Config| c.seats[seat].filter(|s| s.enabled).map(|s| s.freq_mhz);
+                if freq(&old) != freq(&config) {
+                    i.traces[seat] = None;
                 }
-                i.plan_dirty = true;
             }
             i.config = config;
             i.config_rev = i.config_rev.wrapping_add(1);
         });
-    }
-
-    pub fn hello(&self) -> Option<Hello> {
-        self.with(|i| i.host.hello().copied())
     }
 }
 

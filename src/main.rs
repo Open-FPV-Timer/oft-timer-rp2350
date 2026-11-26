@@ -1,6 +1,6 @@
 //! OFT Timer firmware for the Waveshare RP2350-POE-ETH (build B1).
 //!
-//! Tasks: W6300 Ethernet runner, network stack, Node UART rx/tx, SYNC pulses, a pool of
+//! Tasks: W6300 Ethernet runner, network stack, rx/tx per Node link, SYNC pulses, a pool of
 //! HTTP/WebSocket servers, and a status tick. All timing logic lives in `oft-core`.
 
 // The router's type nests once per route.
@@ -13,6 +13,7 @@ mod fw;
 mod mdns;
 mod netdev;
 mod node;
+mod piolink;
 mod settings;
 mod state;
 #[cfg(feature = "usb-console")]
@@ -25,9 +26,10 @@ use embassy_net_wiznet::chip::W6300;
 use embassy_net_wiznet::{Device, Runner, State as WiznetState};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pull};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, SPI0, UART1};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, SPI0, UART0, UART1};
 use embassy_rp::spi::{Async, Config as SpiConfig, Spi};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig, TxPin};
+use node::{LinkRx, LinkTx};
 use embassy_rp::Peri;
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -35,8 +37,10 @@ use panic_halt as _;
 use state::Timer;
 use static_cell::StaticCell;
 
-bind_interrupts!(struct Irqs {
+bind_interrupts!(pub(crate) struct Irqs {
+    UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>;
 });
@@ -50,7 +54,7 @@ pub static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef:
 #[used]
 pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
     embassy_rp::binary_info::rp_program_name!(c"oft-timer-rp2350"),
-    embassy_rp::binary_info::rp_program_description!(c"Open FPV Timer: OFT Protocol over Ethernet, one C5 Node on UART1"),
+    embassy_rp::binary_info::rp_program_description!(c"Open FPV Timer: OFT Protocol over Ethernet, up to four C5 Nodes"),
     embassy_rp::binary_info::rp_cargo_version!(),
     embassy_rp::binary_info::rp_program_build_attribute!(),
 ];
@@ -81,9 +85,9 @@ fn output(n: u8, level: Level) -> Output<'static> {
     Output::new(unsafe { AnyPin::steal(n) }, level)
 }
 
-/// UART1 on the saved pins. embassy names UART pins by type, so every allowed pin is
-/// spelled out here: the same lists as `board::TX_PINS` and `board::RX_PINS`.
-fn node_uart(uart: Peri<'static, UART1>, pins: board::Pins, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
+/// Node 1's link: UART1 on the saved pins. embassy names UART pins by type, so every
+/// allowed pin is spelled out here: the same lists as in `board::tx_pins` and `rx_pins`.
+fn node1_uart(uart: Peri<'static, UART1>, pins: board::NodePins, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
     use embassy_rp::peripherals::{PIN_10, PIN_11, PIN_22, PIN_26, PIN_27, PIN_4, PIN_5, PIN_6, PIN_7, PIN_8};
     fn on<T: TxPin<UART1>>(uart: Peri<'static, UART1>, tx: Peri<'static, T>, rx: u8, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
         // Safety: as for `output`.
@@ -104,6 +108,31 @@ fn node_uart(uart: Peri<'static, UART1>, pins: board::Pins, tx_buf: &'static mut
             22 => on(uart, PIN_22::steal(), pins.rx, tx_buf, rx_buf, cfg),
             26 => on(uart, PIN_26::steal(), pins.rx, tx_buf, rx_buf, cfg),
             _ => on(uart, PIN_4::steal(), pins.rx, tx_buf, rx_buf, cfg),
+        }
+    }
+}
+
+/// Node 2's link: UART0 on the saved pins, as `node1_uart`.
+fn node2_uart(uart: Peri<'static, UART0>, pins: board::NodePins, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
+    use embassy_rp::peripherals::{PIN_0, PIN_1, PIN_12, PIN_13, PIN_14, PIN_15, PIN_2, PIN_28, PIN_3};
+    fn on<T: TxPin<UART0>>(uart: Peri<'static, UART0>, tx: Peri<'static, T>, rx: u8, tx_buf: &'static mut [u8], rx_buf: &'static mut [u8], cfg: UartConfig) -> BufferedUart {
+        // Safety: as for `output`.
+        unsafe {
+            match rx {
+                3 => BufferedUart::new(uart, tx, PIN_3::steal(), Irqs, tx_buf, rx_buf, cfg),
+                13 => BufferedUart::new(uart, tx, PIN_13::steal(), Irqs, tx_buf, rx_buf, cfg),
+                15 => BufferedUart::new(uart, tx, PIN_15::steal(), Irqs, tx_buf, rx_buf, cfg),
+                _ => BufferedUart::new(uart, tx, PIN_1::steal(), Irqs, tx_buf, rx_buf, cfg),
+            }
+        }
+    }
+    unsafe {
+        match pins.tx {
+            2 => on(uart, PIN_2::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            12 => on(uart, PIN_12::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            14 => on(uart, PIN_14::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            28 => on(uart, PIN_28::steal(), pins.rx, tx_buf, rx_buf, cfg),
+            _ => on(uart, PIN_0::steal(), pins.rx, tx_buf, rx_buf, cfg),
         }
     }
 }
@@ -129,20 +158,35 @@ async fn main(spawner: Spawner) {
     drop(recovery_pin);
     let timer: &'static Timer = TIMER.init(Timer::new(seed() as u32, mac, saved, net_boot, net_recovery));
 
-    // --- Node: EN/BOOT lines and the UART, on the saved pins (checked when they were saved
-    // and again when read back; `settings::load` falls back to the defaults).
+    // --- Nodes: the shared EN/BOOT lines and one serial link each, on the saved pins
+    // (checked when they were saved and again when read back; `settings::load` falls back
+    // to the defaults).
     let pins = saved.pins;
     let mut en = output(pins.en, Level::High);
     let mut boot = output(pins.boot, Level::High);
-    node::reset_node(&mut en, &mut boot, false).await;
-    static UART_TX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
-    static UART_RX_BUF: StaticCell<[u8; 2048]> = StaticCell::new();
+    node::reset_nodes(&mut en, &mut boot, false).await;
+    static UART_TX_BUF: [StaticCell<[u8; 1024]>; board::HW_UARTS] = [const { StaticCell::new() }; board::HW_UARTS];
+    static UART_RX_BUF: [StaticCell<[u8; 2048]>; board::HW_UARTS] = [const { StaticCell::new() }; board::HW_UARTS];
     let mut ucfg = UartConfig::default();
     ucfg.baudrate = board::node::BAUD;
-    let uart = node_uart(p.UART1, pins, UART_TX_BUF.init([0; 1024]), UART_RX_BUF.init([0; 2048]), ucfg);
-    let (uart_tx, uart_rx) = uart.split();
-    spawner.spawn(node::node_rx_task(timer, uart_rx).unwrap());
-    spawner.spawn(node::node_tx_task(timer, uart_tx).unwrap());
+    let mut links: [Option<(LinkTx, LinkRx)>; board::MAX_NODES] = [const { None }; board::MAX_NODES];
+    if let Some(np) = pins.nodes[0] {
+        let (tx, rx) = node1_uart(p.UART1, np, UART_TX_BUF[0].init([0; 1024]), UART_RX_BUF[0].init([0; 2048]), ucfg).split();
+        links[0] = Some((LinkTx::Uart(tx), LinkRx::Uart(rx)));
+    }
+    if let Some(np) = pins.nodes[1] {
+        let (tx, rx) = node2_uart(p.UART0, np, UART_TX_BUF[1].init([0; 1024]), UART_RX_BUF[1].init([0; 2048]), ucfg).split();
+        links[1] = Some((LinkTx::Uart(tx), LinkRx::Uart(rx)));
+    }
+    let [l2, l3] = piolink::start(p.PIO0, (p.DMA_CH2, p.DMA_CH3), [pins.nodes[2], pins.nodes[3]], board::node::BAUD);
+    links[2] = l2;
+    links[3] = l3;
+    for (n, link) in links.into_iter().enumerate() {
+        if let Some((tx, rx)) = link {
+            spawner.spawn(node::node_rx_task(timer, n, rx).unwrap());
+            spawner.spawn(node::node_tx_task(timer, n, tx).unwrap());
+        }
+    }
     spawner.spawn(node::sync_task(timer, output(pins.sync, Level::Low)).unwrap());
     spawner.spawn(node::node_ctl_task(timer, en, boot).unwrap());
 
@@ -190,7 +234,7 @@ async fn main(spawner: Spawner) {
     usb::start(spawner, p.USB, timer, fw);
 
     // Keep `main` alive doing nothing; the DMA channel handles are owned by the SPI.
-    let _ = (p.DMA_CH2, stack);
+    let _ = stack;
     loop {
         embassy_time::Timer::after_secs(60).await;
     }
