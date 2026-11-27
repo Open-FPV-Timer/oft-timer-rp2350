@@ -398,7 +398,7 @@ impl Fw {
     }
 }
 
-fn restart(kind: u8) -> ! {
+pub(crate) fn restart(kind: u8) -> ! {
     let (flags, p0) = match kind {
         0 => (REBOOT_TYPE_NORMAL, 0),
         k => {

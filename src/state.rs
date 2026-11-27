@@ -163,11 +163,13 @@ impl Trace {
     }
 }
 
-/// Progress and result of the Node wiring test (`node::node_ctl_task`). EN and BOOT are
-/// one wire each to every Node, so the test runs on all of them and reports each.
+/// Progress and result of the Node restart test (`node::node_ctl_task`), which runs on
+/// every Node and reports each.
 #[derive(Clone, Copy, Default)]
 pub struct WireTest {
     pub running: bool,
+    /// The test used the EN and BOOT wires; otherwise messages on each Node's link.
+    pub by_wire: bool,
     pub done: bool,
     pub step: &'static str,
     pub nodes: [NodeWireTest; MAX_NODES],
@@ -175,10 +177,11 @@ pub struct WireTest {
 
 #[derive(Clone, Copy, Default)]
 pub struct NodeWireTest {
-    /// EN: the Node restarted when the Timer pulsed its reset line.
+    /// The Node restarted when the Timer asked (EN pulsed, or `Reset` over the link).
     pub en_ok: Option<bool>,
     pub en_ms: u32,
-    /// BOOT: held low through a reset, the Node's ROM bootloader answered on the serial link.
+    /// Sent to its ROM bootloader (BOOT held low through a reset, or `Dfu` over the link),
+    /// the Node's bootloader answered on the serial link.
     pub boot_ok: Option<bool>,
     /// The Node came back to normal operation afterwards.
     pub recovered: Option<bool>,
@@ -206,6 +209,8 @@ pub struct NodeFlash {
     pub nodes_done: u8,
     /// Every Node written came back on the Node link afterwards.
     pub returned: Option<bool>,
+    /// The write failed and the Node was left in its bootloader, ready for another attempt.
+    pub in_bootloader: bool,
     pub seconds: u32,
 }
 
@@ -214,6 +219,11 @@ pub struct NodeFlash {
 pub struct NodeState {
     /// Heard from in the last few seconds.
     pub connected: bool,
+    /// The Node has said Hello since it last started, as far as the Timer can tell: set by
+    /// a Hello, cleared when the Node goes quiet or its clock is seen to start again. Only
+    /// then is the Hello the Timer holds (its id, what it can tune) about the firmware that
+    /// is running, and only then does the Node get a plan (`node::node_tx_task`).
+    pub hello_fresh: bool,
     pub last_rx_us: Option<u64>,
     /// 0.1 °C.
     pub temp_dc: Option<i16>,
@@ -228,6 +238,9 @@ pub struct NodeState {
 }
 
 pub struct Inner {
+    /// The crash that ended the last run, if one did. This run then ignores the saved Node
+    /// pins (`crash.rs`).
+    pub crash: Option<crate::crash::Crash>,
     /// Clocks, detectors and the seat schedule for every Node.
     pub hosts: Hosts<MAX_NODES>,
     pub nodes: [NodeState; MAX_NODES],
@@ -308,6 +321,8 @@ impl Inner {
     pub fn node_lost(&mut self, n: usize) {
         if self.nodes[n].connected {
             self.nodes[n].connected = false;
+            // It may come back as other firmware, or another board.
+            self.nodes[n].hello_fresh = false;
             self.reschedule(|h| h.set_up(n, false));
         }
     }
@@ -347,6 +362,7 @@ impl Timer {
         hosts.set_seats(config.enabled_seats().map(|s| (s.seat, s.freq_mhz)));
         Self {
             inner: Mutex::new(RefCell::new(Inner {
+                crash: None,
                 hosts,
                 nodes: [NodeState::default(); MAX_NODES],
                 config,

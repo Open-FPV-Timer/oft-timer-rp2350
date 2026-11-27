@@ -36,7 +36,6 @@ portable-atomic = { version = "1.5", features = ["critical-section"] }
 critical-section = "1.1"
 cortex-m = { version = "0.7.6", features = ["inline-asm"] }
 cortex-m-rt = "0.7.0"
-panic-halt = "1.0"
 
 [features]
 default = ["usb-console"]

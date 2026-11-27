@@ -33,7 +33,7 @@ use node::{LinkRx, LinkTx};
 use embassy_rp::Peri;
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
-use panic_halt as _;
+mod crash;
 use state::Timer;
 use static_cell::StaticCell;
 
@@ -153,7 +153,10 @@ async fn main(spawner: Spawner) {
     let saved = settings::load();
     let recovery_pin = Input::new(p.PIN_9, Pull::Up);
     embassy_time::Timer::after_millis(2).await;
-    let net_recovery = recovery_pin.is_low() && saved.net != state::NetConfig::Dhcp;
+    let jumper = recovery_pin.is_low();
+    // A crash ended the last run: this one starts on safe pins too (`crash.rs`).
+    let crashed = crash::take();
+    let net_recovery = jumper && saved.net != state::NetConfig::Dhcp;
     let net_boot = if net_recovery { state::NetConfig::Dhcp } else { saved.net };
     drop(recovery_pin);
     let timer: &'static Timer = TIMER.init(Timer::new(seed() as u32, mac, saved, net_boot, net_recovery));
@@ -161,10 +164,23 @@ async fn main(spawner: Spawner) {
     // --- Nodes: the shared EN/BOOT lines and one serial link each, on the saved pins
     // (checked when they were saved and again when read back; `settings::load` falls back
     // to the defaults).
-    let pins = saved.pins;
-    let mut en = output(pins.en, Level::High);
-    let mut boot = output(pins.boot, Level::High);
-    node::reset_nodes(&mut en, &mut boot, false).await;
+    // The same jumper ignores the saved Node pins for this start and uses the defaults (one
+    // Node): the way back from pins the board cannot start with. The saved pins stay
+    // saved, and the page shows that a restart would bring them back.
+    let pins = if jumper || crashed.is_some() { board::Pins::default() } else { saved.pins };
+    timer.with(|i| {
+        i.pins_boot = pins;
+        i.crash = crashed;
+    });
+    // EN and BOOT are optional. Where they are wired, the Nodes are reset here so they and
+    // the Timer start together; without them a Node that is already running carries on.
+    let mut wires = match (pins.en, pins.boot) {
+        (Some(en), Some(boot)) => Some(node::Wires { en: output(en, Level::High), boot: output(boot, Level::High) }),
+        _ => None,
+    };
+    if let Some(w) = &mut wires {
+        node::reset_nodes(w, false).await;
+    }
     static UART_TX_BUF: [StaticCell<[u8; 1024]>; board::HW_UARTS] = [const { StaticCell::new() }; board::HW_UARTS];
     static UART_RX_BUF: [StaticCell<[u8; 2048]>; board::HW_UARTS] = [const { StaticCell::new() }; board::HW_UARTS];
     let mut ucfg = UartConfig::default();
@@ -181,6 +197,15 @@ async fn main(spawner: Spawner) {
     let [l2, l3] = piolink::start(p.PIO0, (p.DMA_CH2, p.DMA_CH3), [pins.nodes[2], pins.nodes[3]], board::node::BAUD);
     links[2] = l2;
     links[3] = l3;
+    // A link with no Node on it, or a Node without power, leaves its receive line floating,
+    // and noise from the wires beside it then reads as data (CRC errors on a dead link, seen
+    // 2026-11-27). Hold each receive line at its idle level.
+    for np in pins.nodes.iter().flatten() {
+        embassy_rp::pac::PADS_BANK0.gpio(np.rx as usize).modify(|w| {
+            w.set_pue(true);
+            w.set_pde(false);
+        });
+    }
     for (n, link) in links.into_iter().enumerate() {
         if let Some((tx, rx)) = link {
             spawner.spawn(node::node_rx_task(timer, n, rx).unwrap());
@@ -188,7 +213,7 @@ async fn main(spawner: Spawner) {
         }
     }
     spawner.spawn(node::sync_task(timer, output(pins.sync, Level::Low)).unwrap());
-    spawner.spawn(node::node_ctl_task(timer, en, boot).unwrap());
+    spawner.spawn(node::node_ctl_task(timer, wires).unwrap());
 
     // --- Ethernet: W6300 on SPI0.
     let mut scfg = SpiConfig::default();
@@ -237,6 +262,7 @@ async fn main(spawner: Spawner) {
     let _ = stack;
     loop {
         embassy_time::Timer::after_secs(60).await;
+        crash::healthy();
     }
 }
 

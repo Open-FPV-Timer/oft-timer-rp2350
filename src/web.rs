@@ -96,9 +96,20 @@ struct LinkJson {
 }
 
 #[derive(Serialize)]
+struct CrashJson {
+    count: u32,
+    text: String<200>,
+    safe_pins: bool,
+}
+
+#[derive(Serialize)]
 struct StatusJson {
     #[serde(rename = "type")]
     kind: &'static str,
+    /// The last run ended in a crash: where and why, and how many in a row. This run is
+    /// then on the default Node pins, whatever is saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crash: Option<CrashJson>,
     uptime_s: u64,
     time_us: u64,
     temp_c: Option<f32>,
@@ -309,8 +320,11 @@ pub(crate) struct PinsJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rx: Option<u8>,
     sync: u8,
-    en: u8,
-    boot: u8,
+    /// `null` or left out: not wired.
+    #[serde(default)]
+    en: Option<u8>,
+    #[serde(default)]
+    boot: Option<u8>,
 }
 
 impl From<Pins> for PinsJson {
@@ -372,7 +386,7 @@ struct NodePinChoicesJson {
 struct PinChoicesJson {
     /// What each Node's link may use, Node 1 first: as many entries as the Timer can drive.
     nodes: [NodePinChoicesJson; MAX_NODES],
-    /// For `sync`, `en` and `boot`.
+    /// For `sync`, and for `en` and `boot` where they are wired.
     out: &'static [u8],
 }
 
@@ -501,6 +515,7 @@ fn status_json(t: &Timer) -> StatusJson {
         let w = nodes.get(worst);
         StatusJson {
             kind: "status",
+            crash: i.crash.as_ref().map(|c| CrashJson { count: c.count, text: c.text.clone(), safe_pins: true }),
             uptime_s: now / 1_000_000,
             time_us: now,
             temp_c: nodes.iter().filter_map(|n| n.temp_c).reduce(f32::max),
@@ -1181,7 +1196,8 @@ fn opt_bool(v: Option<bool>) -> &'static str {
     }
 }
 
-/// Progress and result of the Node wiring test. The top-level verdicts are for all the
+/// Progress and result of the Node restart test. `via` says how the Nodes were restarted:
+/// `wires` (EN and BOOT) or `link` (messages on each Node's link). The top-level verdicts are for all the
 /// Nodes together (the slowest time, and a pass only if every Node passed); `nodes` has
 /// each one's.
 async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
@@ -1191,10 +1207,11 @@ async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
     let mut s = String::new();
     let _ = write!(
         s,
-        "{{\"running\":{},\"done\":{},\"step\":\"{}\",\"en_ok\":{},\"en_ms\":{},\"boot_ok\":{},\"recovered\":{},\"recover_ms\":{},\"nodes\":[",
+        "{{\"running\":{},\"done\":{},\"step\":\"{}\",\"via\":\"{}\",\"en_ok\":{},\"en_ms\":{},\"boot_ok\":{},\"recovered\":{},\"recover_ms\":{},\"nodes\":[",
         w.running,
         w.done,
         w.step,
+        if w.by_wire { "wires" } else { "link" },
         opt_bool(all(|n| n.en_ok)),
         nodes.iter().map(|n| n.en_ms).max().unwrap_or(0),
         opt_bool(all(|n| n.boot_ok)),
@@ -1217,7 +1234,7 @@ async fn get_wiretest(State(AppState(t, _)): State<AppState>) -> RawJson {
     RawJson::ok(s)
 }
 
-/// Start the Node wiring test (EN and BOOT lines). Bench diagnostic, not part of the OFT
+/// Start the Node restart test (over the Node link, or the EN and BOOT wires if fitted). Bench diagnostic, not part of the OFT
 /// Protocol: it resets the Nodes three times and stops timing while it runs.
 async fn post_wiretest(State(state): State<AppState>, _: Writer) -> RawJson {
     let t = state.0;
@@ -1395,7 +1412,8 @@ async fn fw_receive<R: picoserve::io::Read>(fw: &'static Fw, request: &mut picos
 }
 
 /// `POST /oft/v1/fw/node?offset=65536&baud=115200`: firmware for the Node, written to it over
-/// the Node link's UART through the C5's ROM bootloader (EN and BOOT wires needed). The body
+/// the Node link's UART through the C5's ROM bootloader (reached over the Node link; the EN
+/// and BOOT wires are only a fallback). The body
 /// is the raw file for that offset: `firmware.bin` at 0x10000 (the default),
 /// `bootloader.bin` at 0x2000, `partitions.bin` at 0x8000. It is stored in the Timer's flash
 /// first and checked; the transfer then runs on its own, with progress at `GET`.
@@ -1407,7 +1425,7 @@ fn node_flash_json(t: &Timer) -> RawJson {
     let mut s: String<BODY> = String::new();
     let _ = write!(
         s,
-        "{{\"supported\":true,\"running\":{},\"done\":{},\"ok\":{},\"step\":\"{}\",\"error\":\"{}\",\"offset\":{},\"bytes\":{},\"written\":{},\"baud\":{},\"seconds\":{},\"node\":{},\"nodes\":{},\"nodes_done\":{},\"node_connected\":{},\"max_bytes\":{}",
+        "{{\"supported\":true,\"running\":{},\"done\":{},\"ok\":{},\"step\":\"{}\",\"error\":\"{}\",\"offset\":{},\"bytes\":{},\"written\":{},\"baud\":{},\"seconds\":{},\"node\":{},\"nodes\":{},\"nodes_done\":{},\"node_connected\":{},\"in_bootloader\":{},\"max_bytes\":{}",
         f.running,
         f.done,
         f.ok,
@@ -1422,6 +1440,7 @@ fn node_flash_json(t: &Timer) -> RawJson {
         f.nodes,
         f.nodes_done,
         connected,
+        f.in_bootloader,
         oft_fwimage::layout::NODE_STORE_BYTES
     );
     let _ = s.push_str(",\"diag\":\"");
@@ -1682,7 +1701,7 @@ pub async fn net_watch_task(timer: &'static Timer, stack: Stack<'static>) {
 /// Publish a `Status` event once a second for WebSocket subscribers.
 #[embassy_executor::task]
 pub async fn status_tick_task(timer: &'static Timer) {
-    let publisher = timer.events.publisher().unwrap();
+    let publisher = timer.events.immediate_publisher();
     loop {
         embassy_time::Timer::after_secs(1).await;
         if BOOTSEL_REQUESTED.load(core::sync::atomic::Ordering::Relaxed) {

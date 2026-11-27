@@ -4,8 +4,12 @@ Firmware for the **Waveshare RP2350-POE-ETH** (RP2350A, W6300 Ethernet, PoE modu
 to four **XIAO ESP32-C5** Nodes, each on its own serial link. It serves the OFT Protocol (spec §6) on port 7270 and runs the
 shared `oft-core` detection and clock mapping. Rust, Embassy, stable toolchain.
 
-Status (2026-11-08): **compiles for the target; not yet run on hardware.** The boards are on
-order. Everything above the chip drivers is the same code tested in the `oft` workspace.
+Status (2026-11-27): **running on hardware with four Nodes** on a breadboard, two on the
+hardware UARTs and two on PIO links: 1 to 8 seats, Nodes powered off and on while running,
+Node firmware written through the Timer with no EN or BOOT wires, the Timer updated over
+the network many times. Everything above the chip drivers is the same code tested in the
+`oft` workspace. Not run: the EN and BOOT wire fallback since it was reworked, and a real
+race.
 
 ## Build and flash
 
@@ -122,9 +126,9 @@ OFT_FW_IMAGE=../oft-timer.bin cargo test --target x86_64-unknown-linux-gnu   # a
 | GND | GND | GND |
 | UART TX → Node RX | GP4 | D7 (GPIO12) |
 | UART RX ← Node TX | GP5 | D6 (GPIO11) |
-| SYNC | GP6 → | free GPIO (input) |
-| Node EN (reset) | GP7 → | EN / RST |
-| Node BOOT | GP8 → | BOOT strap |
+| SYNC | GP6 → | D8 (GPIO8) |
+| Node EN (reset), optional | GP7 → | EN pad (back of the XIAO) |
+| Node BOOT, optional | GP8 → | BOOT pad (back of the XIAO) |
 
 These are the default pins, for one Node. The wiring is a saved setting: the **Advanced**
 page (or `PUT /oft/v1/pins`) moves it, applied at the next restart, so a board wired
@@ -132,11 +136,22 @@ differently runs the same firmware. SYNC, EN and BOOT take any header GPIO but G
 recovery jumper). Wrong pins cannot lock you out: the page stays reachable and a Node
 stays silent until they match the wiring.
 
+**EN and BOOT are optional and off by default** (since 2026-11-27). The Timer restarts a
+Node (`Reset`) and sends it to its ROM bootloader (`Dfu`) over the Node link, so five wires
+are a whole Node: 5 V, GND, two data wires and SYNC, all on the XIAO's header pins. A build
+that has EN and BOOT wired sets them on the Advanced page (GP7 and GP8 in the table); the
+Timer then still tries the link first and uses the wires when a Node does not answer. A
+board that had them wired before this change needs that setting once, since the default is
+now "not wired". Without the wires, a Node whose firmware no longer answers is recovered by
+hand: hold its BOOT button, tap RESET, release BOOT, then upload from the Timer's page
+again; or flash it over its own USB port.
+
 ### More than one Node
 
 Set **Nodes** on the Advanced page to how many are wired (up to four) and give each its
-data pins. Every Node has its own TX/RX pair. SYNC, EN and BOOT are one wire each, joined
-to every Node (so a reset restarts them all).
+data pins. Every Node has its own TX/RX pair. SYNC is one wire joined to every Node. EN
+and BOOT, if fitted, are also one wire each joined to every Node, so using them restarts
+them all.
 
 | Node | Link | Timer TX (to the Node's D7) | Timer RX (from the Node's D6) |
 |---|---|---|---|
@@ -150,11 +165,18 @@ to every Node (so a reset restarts them all).
 - **A Node that goes quiet for 3 s loses its seats** to the others, and takes seats back
   when it returns. Seats that do not move are not disturbed.
 - **Node firmware** goes to every wired Node, one after the other, from one upload
-  (`?node=0` writes only the first, and so on). All Nodes restart together.
-- **The wiring test** reports each Node separately.
-- **Not yet run on hardware:** all of the above. The two-Node path uses the same UART
-  driver as the one-Node firmware. Nodes 3 and 4 use new receive code (`src/piolink.rs`:
-  PIO state machines emptied by DMA) that has only been compiled.
+  (`?node=0` writes only the first, and so on). Over the link each Node restarts on its
+  own and the others keep timing; with EN and BOOT they all restart together.
+- **The Node restart test** reports each Node separately.
+- **Run on hardware 2026-11-27** with four Nodes: all of the above. Pulling a Node's power
+  moved its seats to the others, and it took seats back when it returned, with all eight
+  seats covered throughout, down to two Nodes. The PIO links (`src/piolink.rs`: state
+  machines emptied by DMA) lose nothing while the Timer writes its own flash, which the
+  hardware UARTs do.
+- **A Node gets a plan only after it has said Hello since it last started.** A Node repeats
+  its Hello until a plan arrives, and the first is often lost in its start-up text. A Node
+  that is talking but has not said Hello within 4 s (it kept running across a Timer
+  restart) is restarted over its link, so it says it.
 
 W6300: SPI0 SCK GP18, MOSI GP19, MISO GP16, CS GP17, RST GP20, INT GP21 (Waveshare's
 `DEV_Config.h`). Board extras not used yet: WS2812 on GP25, USB detect GP24, PoE detect
@@ -166,6 +188,19 @@ Set a fixed address under **Network** on the Timer's page; it applies at the nex
 If the address turns out wrong and the Timer cannot be reached: fit a jumper between header
 pins 12 (GP9) and 13 (GND) and power it up. With the jumper fitted it ignores the saved
 address and uses DHCP for that start; save working settings, then remove the jumper.
+
+The same jumper also ignores the saved **Node pins** for that start and uses the defaults
+(one Node on GP4/GP5), for pins the board cannot start with. Not yet tried on hardware.
+
+## After a crash
+
+A panic no longer halts the Timer. It records where and why in RAM that a restart keeps,
+restarts, and the next start reports it as `crash` in `/status` (`{"count", "text",
+"safe_pins"}`) and runs on the default Node pins, whatever is saved, so the Timer reaches
+the network. Restarting again (the Restart button, an update) goes back to the saved pins.
+Five crashes in a row without a minute of running in between and it halts, as it used to.
+`src/crash.rs`. This is what found the fault that stopped the first start with more than
+one Node. A hang, as opposed to a panic, is still not caught: see "Not yet".
 
 ## USB serial console (optional)
 
@@ -182,7 +217,8 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 ## What it does
 
 - `node.rs`: per Node, decodes Node-link frames (COBS + CRC-16) into `oft_core::Hosts`, sends
-  its `Plan` and `Ping`; pulses SYNC at 20 Hz; resets the C5s at boot via EN/BOOT.
+  its `Plan` and `Ping`; pulses SYNC at 20 Hz; restarts the C5s and reaches their
+  bootloaders over the link (`Reset`, `Dfu`), or with EN/BOOT where those are wired.
   `piolink.rs` is the serial link for Nodes 3 and 4.
 - `state.rs`: shared state behind a critical-section mutex; 64-crossing replay buffer; a 100 Hz,
   30 s trace per seat for `/samples`; a pub/sub channel feeding WebSocket clients.
@@ -194,8 +230,22 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
   for DHCP or a fixed address, `POST /oft/v1/restart`. A save stops timing for about 50 ms.
 - Node firmware through the Timer: `POST /oft/v1/fw/node?offset=65536` with the Node's
   `firmware.bin` (or the bootloader at 0x2000, the partition table at 0x8000). The Timer
-  stores and checks the file, restarts the C5 into its ROM bootloader with EN and BOOT,
-  writes it over the Node link's UART and compares an MD5 (`fwimage/src/esprom.rs` has the
+  stores and checks the file, restarts the C5 into its ROM bootloader (`Dfu` over the link;
+  EN and BOOT as the fallback), writes it over the Node link's UART, compares an MD5 and
+  starts the Node again (over the link: the bootloader is told to clear the C5's
+  force-download request and arm the chip's watchdog). Run on hardware 2026-11-27 with no
+  EN or BOOT wires: two writes of the 701 KiB firmware, 114 s at 115200 baud and 52 s at
+  921600, both checked and both Nodes back on SYNC. Since then, on four Nodes and both
+  kinds of link: 77 s at 115200 and 17 to 23 s at 921600 with no retries (first contact is
+  always at 115200; the faster rate is set by command, which makes it exact). **A Node in
+  its bootloader that hears the Timer's ordinary 921600-baud traffic before it is called
+  settles on the wrong rate** and answers nothing at 115200; it looks dead but is not. The
+  Timer now tells such a Node, at the link's rate, to move to 115200, and carries on; that
+  rescued a Node that had sat silent for minutes. **If a write fails, the Node is left in its
+  bootloader** (not restarted into partly written firmware), and the next upload finds it
+  there and carries on; that retry is not yet run on hardware. Power lost in that state
+  still needs a hand: BOOT and RESET on the Node, then upload again, or its USB port.
+  The lasting fix is two firmware slots on the Node (planned) (`fwimage/src/esprom.rs` has the
   protocol, host-tested). About two minutes for the firmware at 115200 baud. The C5's
   bootloader loses an answer every few seconds for a reason not yet found; the Timer starts
   a new write session at that point each time. Progress and a diagnosis at `GET`.
@@ -211,17 +261,19 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 
 ## Not yet
 
-- **A watchdog in normal running.** The firmware halts on a panic (`panic-halt`) and the
-  watchdog only runs while a network update is on trial, so a crash or a hang leaves the
-  Timer dead until its power is cycled. Seen once (2026-11-21): the Timer went off the
-  network while receiving a firmware upload, about 20 minutes after start and just after a
-  `bench/conformance.py` run, and stayed off until it was power-cycled; the same upload
-  then worked twice, each within a minute of a restart. The cause was not found: the update
-  logic takes that same file correctly on the host (`fwimage` tests). A watchdog fed from
-  the executor would have turned that into a restart. It should also record why the Timer
-  restarted (watchdog or power) and show it in `/status`, so a hang like that one leaves a
-  trace. Until then, a Timer that stops answering needs a power cycle; an interrupted
-  update is safe, since the boot ROM keeps starting the old firmware.
+- **A watchdog in normal running.** A panic is now recorded and followed by a restart
+  ("After a crash"), but a hang is not: the watchdog only runs while a network update is on
+  trial. Seen once (2026-11-21): the Timer went off the network while receiving a firmware
+  upload, about 20 minutes after start, and stayed off until it was power-cycled. The cause
+  was not found. A watchdog fed from the executor would turn that into a restart, and the
+  crash record could then say so.
+- **Two firmware slots on the Node**, so that a failed or interrupted Node write leaves the
+  old firmware running. Today there is one slot: a write that fails leaves the Node waiting
+  in its bootloader for another attempt, but power lost in that state needs a hand on the
+  Node (BOOT and RESET, then upload again, or its USB port). The Node should describe its
+  own flash layout to the Timer, so the Timer does not have to know it per chip.
+- The web server refused one connection during a burst of requests (2026-11-27) and
+  carried on; not looked into.
 - Status LED.
 - Renaming the Timer. Today `/info` says "OFT Timer" for every Timer, and the id
   (`oft-a867`) comes from the chip. A name set from the page and the USB console, saved

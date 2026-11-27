@@ -2,7 +2,9 @@
 //!
 //! W6300 pins come from Waveshare's demo (`lib/Config/DEV_Config.h`). The Node, SYNC and
 //! EN/BOOT pins are a saved setting (`Pins`): the numbers in `node` are its defaults, our
-//! choice of free header GPIOs. Everything hardware-specific is named here and nowhere else.
+//! choice of free header GPIOs. EN and BOOT are optional and not wired by default: the
+//! Timer restarts a Node, and sends it to its bootloader, over the Node link.
+//! Everything hardware-specific is named here and nowhere else.
 
 #![allow(dead_code)] // the pin constants document the wiring; embassy names pins by type (PIN_18)
 
@@ -30,9 +32,10 @@ pub mod node {
     pub const BAUD: u32 = 921_600;
     /// SYNC pulse output, one wire to every Node's SYNC input.
     pub const SYNC: u8 = 6;
-    /// C5 EN (reset), active low. One wire to every Node.
+    /// C5 EN (reset), active low. One wire to every Node. Optional: the pin the carrier
+    /// boards and the wiring tables suggest for it, not a default.
     pub const EN: u8 = 7;
-    /// C5 BOOT strap, low = download mode. One wire to every Node.
+    /// C5 BOOT strap, low = download mode. One wire to every Node. Optional, as `EN`.
     pub const BOOT: u8 = 8;
 }
 
@@ -49,19 +52,21 @@ pub struct NodePins {
 /// board wired differently needs a setting, not its own firmware.
 ///
 /// How many Nodes the Timer drives is how many links are listed. Each Node has its own
-/// link; SYNC, EN and BOOT are each one wire shared by every Node.
+/// link; SYNC is one wire shared by every Node. EN and BOOT, where they are wired at all,
+/// are also one wire each to every Node; they are used together or not at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Pins {
     /// Node 1 first; filled from the front.
     pub nodes: [Option<NodePins>; MAX_NODES],
     pub sync: u8,
-    pub en: u8,
-    pub boot: u8,
+    /// `None`: not wired.
+    pub en: Option<u8>,
+    pub boot: Option<u8>,
 }
 
 impl Default for Pins {
     fn default() -> Self {
-        Self { nodes: [Some(NodePins { tx: node::TX, rx: node::RX }), None, None, None], sync: node::SYNC, en: node::EN, boot: node::BOOT }
+        Self { nodes: [Some(NodePins { tx: node::TX, rx: node::RX }), None, None, None], sync: node::SYNC, en: None, boot: None }
     }
 }
 
@@ -122,7 +127,10 @@ impl Pins {
             let _ = all.push(p.tx);
             let _ = all.push(p.rx);
         }
-        for p in [self.sync, self.en, self.boot] {
+        if self.en.is_some() != self.boot.is_some() {
+            return Err("en and boot are used together: set both or neither");
+        }
+        for p in [Some(self.sync), self.en, self.boot].into_iter().flatten() {
             if !OUT_PINS.contains(&p) {
                 return Err("sync, en and boot must be header GPIOs: 0-8, 10-15, 22, 26-28");
             }
