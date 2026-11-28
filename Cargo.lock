@@ -1004,14 +1004,14 @@ dependencies = [
 
 [[package]]
 name = "oft-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oft-nodelink",
 ]
 
 [[package]]
 name = "oft-esprom"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "oft-fwimage"
@@ -1023,11 +1023,11 @@ dependencies = [
 
 [[package]]
 name = "oft-nodelink"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "oft-timer-rp2350"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",

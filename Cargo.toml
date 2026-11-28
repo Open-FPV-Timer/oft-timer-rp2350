@@ -1,6 +1,6 @@
 [package]
 name = "oft-timer-rp2350"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "OFT Timer firmware for the Waveshare RP2350-POE-ETH (RP2350A + W6300 + PoE): up to four C5 Nodes on serial links, OFT Protocol over Ethernet"
