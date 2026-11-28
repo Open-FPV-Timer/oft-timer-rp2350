@@ -120,6 +120,8 @@ struct StatusJson {
     clock_source: &'static str,
     drift_ppm: Option<f64>,
     node_connected: bool,
+    /// What is wrong with the Timer, for race software (spec 6.3): empty when nothing is.
+    problems: Vec<&'static str, 4>,
     link: LinkJson,
     /// Every wired Node. The Node fields above sum these up: the worst clock, the highest
     /// temperature, the counts added together, `node_connected` only if all are.
@@ -526,6 +528,19 @@ fn status_json(t: &Timer) -> StatusJson {
             clock_source: w.map_or("none", |n| n.clock_source),
             drift_ppm: w.and_then(|n| n.drift_ppm),
             node_connected: !nodes.is_empty() && nodes.iter().all(|n| n.connected),
+            problems: {
+                let mut p = Vec::new();
+                if nodes.iter().any(|n| !n.connected) {
+                    let _ = p.push("node_missing");
+                }
+                if i.crash.as_ref().is_some_and(|c| c.safe_pins) {
+                    let _ = p.push("safe_mode");
+                }
+                if i.crash.is_some() {
+                    let _ = p.push("crashed");
+                }
+                p
+            },
             link,
             nodes,
             seats,
@@ -602,10 +617,11 @@ fn info_json(t: &Timer, self_update: bool, hello: bool, out: &mut String<BIG>) {
          \"samples.stream\":{{\"rate_hz\":{},\"decimate\":[1,2,5,10,20,50]}},\
          \"samples.history\":{{\"full_rate_s\":0,\"reduced_rate_s\":{},\"reduced_hz\":{}}},\
          \"config\":{{\"persist\":true,\"threshold_modes\":[\"auto\",\"manual\"],\"min_lap_ms\":true,\"seat_thresholds\":true,\"exit_hold_ms\":true,\"pass_window_ms\":true}},\
-         \"network\":{{\"static\":true}},\
-         \"pins\":{{\"max_nodes\":{}}},\
          \"control\":{{}},\
-         \"time\":{{\"sync\":[\"sync\",\"ping\"]}},{}\
+         \"time\":{{\"sync\":[\"sync\",\"ping\"]}}}},\
+         \"manage_url\":\"/\",\
+         \"manage\":{{\"network\":{{\"static\":true}},\
+         \"pins\":{{\"max_nodes\":{}}},{}\
          \"fw.update\":{{\"nodes\":[\"uart\"],\"self\":{}}}}}}}",
         crate::state::CROSSING_REPLAY,
         rate,

@@ -182,6 +182,31 @@ W6300: SPI0 SCK GP18, MOSI GP19, MISO GP16, CS GP17, RST GP20, INT GP21 (Wavesha
 `DEV_Config.h`). Board extras not used yet: WS2812 on GP25, USB detect GP24, PoE detect
 GP23, VSYS ADC GP29. All pins, and which ones the Node may use, are in `src/board.rs`.
 
+## Managing the Timer (not part of the OFT Protocol)
+
+The OFT Protocol (spec §6) is what race software uses. Everything below is this Timer's
+own business, done on its page at `http://<ip>:7270/` (`manage_url` in `/info`). The page
+uses these endpoints, also under `/oft/v1`; they can change with the firmware, and race
+software must not depend on them. They moved here from the spec at v0.12.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET / PUT | `/network` | Body `{"mode":"dhcp"}` or `{"mode":"static","address":"192.168.1.50","prefix":24,"gateway":"192.168.1.1","dns":"..."}` (gateway and dns optional). Stored at once, used from the next start. `GET` answers `{"saved":{...},"using":"dhcp"|"static"|"dhcp (recovery jumper)","now":{"address","prefix","gateway"},"restart_needed":bool}`. A Timer with a fixed address needs a documented way back to DHCP without the network |
+| GET / PUT | `/pins` | For Timers whose Nodes are wired to GPIO pins. Body: the pin (GPIO number) for each signal, `{"nodes":[{"tx":4,"rx":5}],"sync":6,"en":7,"boot":8}`. `nodes` has one serial link per Node, first Node first, and its length is how many Nodes the Timer drives (1 to `capabilities.pins.max_nodes`); `tx` is the Timer's transmit (to the Node's RX). `sync` is one wire shared by every Node. `en` and `boot` are optional (§5.1): `null` or left out means not wired, and they are given together or not at all; where given they too are one wire each to every Node. Stored at once, used from the next start; a body the hardware cannot do is refused with 400 and a reason. `GET` answers `{"saved":{...},"using":{...},"defaults":{...},"choices":{"nodes":[{"tx":[...],"rx":[...]}, ...],"out":[...]},"restart_needed":bool}`; `choices.nodes[k]` lists the pins the k-th link may use (links differ: some are hardware UARTs with fixed pins) and `choices.out` the pins allowed for `sync`, and for `en` and `boot` where they are wired. Clients should keep this out of everyday view: it only changes when a board is wired differently |
+| POST | `/restart` | Restart the Timer (202, then the connection drops) |
+| GET / POST | `/fw/timer` | Update this firmware over the network (above) |
+| GET / POST | `/fw/node` | Write Node firmware through the Timer (`?offset=65536&baud=115200&node=N`); progress, `diag` and `in_bootloader` at `GET` |
+| GET / POST | `/node/wiretest` | The Node restart test: `via` (`link` or `wires`), and per Node `en_ok`, `boot_ok`, `recovered` |
+| POST | `/fw/bootsel` | Restart as the `RP2350` USB drive |
+
+`/info` lists what this page can do here under `manage`: `network`, `pins`
+(`max_nodes`), `fw.update` (`nodes`, `self`) and `usb.console`. Before v0.12 these were
+capabilities.
+
+`/status` carries `crash` (`count`, `text`, `safe_pins`) on the start after a firmware
+crash ("After a crash"). Race software sees the same events as names in `problems`:
+`crashed`, `safe_mode`, and `node_missing` for a wired Node that is not answering.
+
 ## Fixed address and the way back
 
 Set a fixed address under **Network** on the Timer's page; it applies at the next restart.
