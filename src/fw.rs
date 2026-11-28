@@ -399,6 +399,7 @@ impl Fw {
 }
 
 pub(crate) fn restart(kind: u8) -> ! {
+    crate::crash::stopping();
     let (flags, p0) = match kind {
         0 => (REBOOT_TYPE_NORMAL, 0),
         k => {
@@ -422,9 +423,15 @@ pub async fn fw_task(fw: &'static Fw, stack: Stack<'static>) -> ! {
     loop {
         embassy_time::Timer::after_millis(250).await;
         let now = Instant::now();
+        // The tasks are running: tell the hardware watchdog (`crash.rs`). Not during a
+        // trial, which has its own rule below and must be allowed to run out.
+        if !fw.on_trial() && !fw.restarting() {
+            crate::crash::feed();
+        }
         if fw.on_trial() && !fw.restarting() {
             if now.as_micros() < TRIAL_FEED.as_micros() {
-                // The boot ROM armed the watchdog to restart the board; push that out.
+                // The watchdog is running (`main`); push it out while the trial may still
+                // succeed, then let it run down.
                 pac::WATCHDOG.load().write_value(pac::watchdog::regs::Load(WATCHDOG_MAX_US));
             }
             if stack.is_config_up() && fw.http_seen.load(Ordering::Relaxed) {

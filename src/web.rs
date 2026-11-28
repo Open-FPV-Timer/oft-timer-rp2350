@@ -515,7 +515,7 @@ fn status_json(t: &Timer) -> StatusJson {
         let w = nodes.get(worst);
         StatusJson {
             kind: "status",
-            crash: i.crash.as_ref().map(|c| CrashJson { count: c.count, text: c.text.clone(), safe_pins: true }),
+            crash: i.crash.as_ref().map(|c| CrashJson { count: c.count, text: c.text.clone(), safe_pins: c.safe_pins }),
             uptime_s: now / 1_000_000,
             time_us: now,
             temp_c: nodes.iter().filter_map(|n| n.temp_c).reduce(f32::max),
@@ -1705,6 +1705,7 @@ pub async fn status_tick_task(timer: &'static Timer) {
     loop {
         embassy_time::Timer::after_secs(1).await;
         if BOOTSEL_REQUESTED.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::crash::stopping();
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
         }
         if timer.with(|i| i.control.expire(crate::state::now_us())) {

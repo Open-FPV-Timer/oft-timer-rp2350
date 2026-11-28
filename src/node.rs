@@ -728,6 +728,11 @@ async fn enter_bootloader(n: usize, baud: u32, wires: &mut Option<Wires>, frame:
     ROM_MODE[n].store(ROM_LOADER, Ordering::Relaxed);
     Delay::after_millis(40).await;
     set_baud(n, crate::board::node::BAUD);
+    // Call it at that rate first: it has to hear a whole SYNC at the rate it leans towards
+    // before it takes any command (telling it to change rate without that got nothing,
+    // 2026-11-27). Its answers may be unreadable here; it is the hearing that counts.
+    let heard = rom_sync(Duration::from_millis(900), frame).await;
+    diag(format_args!("[called at the link's rate: {}] ", if heard { "answered" } else { "no clean answer" }));
     for _ in 0..3 {
         let _ = rom_cmd(&esprom::change_baud(ROM_BAUD), Duration::from_millis(120), frame).await;
     }
@@ -764,6 +769,11 @@ async fn enter_bootloader(n: usize, baud: u32, wires: &mut Option<Wires>, frame:
     Err("the Node's bootloader did not answer, over the Node link or after EN and BOOT (check those wires with the Node restart test)")
 }
 
+/// A Node that was put into its bootloader by hand (BOOT held through RESET) does not
+/// start this way: the chip keeps the BOOT strap it read at that reset, and the restart
+/// here is not one that reads it again, so it comes back to its bootloader, written and
+/// checked, until its RESET button is tapped (seen 2026-11-28).
+///
 /// Start the firmware of the Node whose bootloader is on the `ROM_LOADER` link, without
 /// the EN wire: withdraw the request to start in the bootloader (set by the Node's `Dfu`
 /// handler, and harmless to clear if the BOOT button was used), then let the chip's own

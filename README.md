@@ -190,17 +190,21 @@ pins 12 (GP9) and 13 (GND) and power it up. With the jumper fitted it ignores th
 address and uses DHCP for that start; save working settings, then remove the jumper.
 
 The same jumper also ignores the saved **Node pins** for that start and uses the defaults
-(one Node on GP4/GP5), for pins the board cannot start with. Not yet tried on hardware.
+(one Node on GP4/GP5), for pins the board cannot start with. Tried 2026-11-28: one Node up
+on the default pins, the four-Node pins still saved.
 
 ## After a crash
 
 A panic no longer halts the Timer. It records where and why in RAM that a restart keeps,
 restarts, and the next start reports it as `crash` in `/status` (`{"count", "text",
-"safe_pins"}`) and runs on the default Node pins, whatever is saved, so the Timer reaches
-the network. Restarting again (the Restart button, an update) goes back to the saved pins.
-Five crashes in a row without a minute of running in between and it halts, as it used to.
-`src/crash.rs`. This is what found the fault that stopped the first start with more than
-one Node. A hang, as opposed to a panic, is still not caught: see "Not yet".
+"safe_pins"}`). If the panic came in the first minute of a run, that next start also runs on
+the default Node pins, whatever is saved (`safe_pins`), so a Timer that fails at start-up
+still reaches the network; restarting again (the Restart button, an update) goes back to the
+saved pins. A panic after a minute of running restarts on the saved pins, so a race carries
+on. `src/crash.rs`. This is what found the fault that stopped the first start with more
+than one Node, and two faults in itself.
+
+A **hang**, as opposed to a panic, is still not caught: see "Not yet".
 
 ## USB serial console (optional)
 
@@ -240,8 +244,13 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
   always at 115200; the faster rate is set by command, which makes it exact). **A Node in
   its bootloader that hears the Timer's ordinary 921600-baud traffic before it is called
   settles on the wrong rate** and answers nothing at 115200; it looks dead but is not. The
-  Timer now tells such a Node, at the link's rate, to move to 115200, and carries on; that
-  rescued a Node that had sat silent for minutes. **If a write fails, the Node is left in its
+  Timer now calls such a Node at the link's rate (it has to hear a whole SYNC there before
+  it takes a command), tells it to move to 115200, and carries on; that rescued Nodes that
+  had sat silent for minutes.
+  **By hand**, for a Node whose firmware does not answer (tried 2026-11-28): hold its BOOT
+  button, tap RESET, release BOOT; upload from the Timer's page; then tap RESET once more.
+  The last tap is needed because the chip keeps the BOOT strap it read at the hardware
+  reset, and the Timer's restart of it is not one that reads the strap again. **If a write fails, the Node is left in its
   bootloader** (not restarted into partly written firmware), and the next upload finds it
   there and carries on; that retry is not yet run on hardware. Power lost in that state
   still needs a hand: BOOT and RESET on the Node, then upload again, or its USB port.
@@ -261,12 +270,19 @@ pid.codes test pair (1209:0001): get real ones before boards go to other people.
 
 ## Not yet
 
-- **A watchdog in normal running.** A panic is now recorded and followed by a restart
-  ("After a crash"), but a hang is not: the watchdog only runs while a network update is on
-  trial. Seen once (2026-11-21): the Timer went off the network while receiving a firmware
-  upload, about 20 minutes after start, and stayed off until it was power-cycled. The cause
-  was not found. A watchdog fed from the executor would turn that into a restart, and the
-  crash record could then say so.
+- **A watchdog in normal running.** A hang (the tasks stop, no panic) still leaves the
+  Timer off the network, Ethernet lights on, until its RESET button is pressed. Seen
+  2026-11-21 (during a firmware upload) and once on 2026-11-27 (about 90 s after a failed
+  Node write, cause not found). The watchdog is written and switched off
+  (`crash::WATCHDOG_ENABLED`). What the attempt found, 2026-11-28:
+  - `embassy_rp::watchdog::Watchdog::start` (0.10) picks what the watchdog resets with the
+    RP2040's list, which on the RP2350 leaves the processors out. `crash::watchdog_start`
+    uses the pico-sdk's value for the RP2350 instead.
+  - The boot ROM switches the watchdog off when it confirms an update (`explicit_buy`), so
+    a freshly updated Timer has none; `crash::feed` switches it back on.
+  - With the watchdog on, two firmware uploads out of two stopped the Timer part way, and a
+    deliberate hang was not followed by a restart. Not understood. It needs a debug probe:
+    each blind try costs a walk to the RESET button.
 - **Two firmware slots on the Node**, so that a failed or interrupted Node write leaves the
   old firmware running. Today there is one slot: a write that fails leaves the Node waiting
   in its bootloader for another attempt, but power lost in that state needs a hand on the

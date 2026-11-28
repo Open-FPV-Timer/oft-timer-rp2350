@@ -154,8 +154,13 @@ async fn main(spawner: Spawner) {
     let recovery_pin = Input::new(p.PIN_9, Pull::Up);
     embassy_time::Timer::after_millis(2).await;
     let jumper = recovery_pin.is_low();
-    // A crash ended the last run: this one starts on safe pins too (`crash.rs`).
+    // A crash or a hang ended the last run (`crash.rs`). If it came in that run's first
+    // minute, this one starts on safe pins too.
     let crashed = crash::take();
+    // From here on the tasks have to keep running: `fw::fw_task` feeds this, and a hang is
+    // ended by a restart `WATCHDOG_US` later. A trial after an update arrives with the
+    // boot ROM's own watchdog already running; this replaces its 16.7 s with the same reach.
+    crash::watchdog_start();
     let net_recovery = jumper && saved.net != state::NetConfig::Dhcp;
     let net_boot = if net_recovery { state::NetConfig::Dhcp } else { saved.net };
     drop(recovery_pin);
@@ -167,7 +172,7 @@ async fn main(spawner: Spawner) {
     // The same jumper ignores the saved Node pins for this start and uses the defaults (one
     // Node): the way back from pins the board cannot start with. The saved pins stay
     // saved, and the page shows that a restart would bring them back.
-    let pins = if jumper || crashed.is_some() { board::Pins::default() } else { saved.pins };
+    let pins = if jumper || crashed.as_ref().is_some_and(|c| c.safe_pins) { board::Pins::default() } else { saved.pins };
     timer.with(|i| {
         i.pins_boot = pins;
         i.crash = crashed;
